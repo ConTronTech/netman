@@ -383,4 +383,260 @@ bool restore_rules(const std::string& filepath) {
     // 4. Apply one by one with apply_rule()
 }
 
+// === CommandBuilder implementation ===
+
+// Helper functions for enum to string conversion
+static std::string action_str(Action a) {
+    switch (a) {
+        case Action::APPEND: return "-A";
+        case Action::INSERT: return "-I";
+        case Action::DELETE: return "-D";
+        case Action::CHECK:  return "-C";
+        case Action::LIST:   return "-L";
+        case Action::SAVE:   return "-S";
+    }
+    return "";
+}
+
+static std::string table_str(Table t) {
+    switch (t) {
+        case Table::FILTER: return "filter";
+        case Table::NAT:    return "nat";
+        case Table::MANGLE: return "mangle";
+        case Table::RAW:    return "raw";
+    }
+    return "filter";
+}
+
+static std::string chain_str(Chain c) {
+    switch (c) {
+        case Chain::INPUT:       return "INPUT";
+        case Chain::OUTPUT:      return "OUTPUT";
+        case Chain::FORWARD:     return "FORWARD";
+        case Chain::PREROUTING:  return "PREROUTING";
+        case Chain::POSTROUTING: return "POSTROUTING";
+    }
+    return "";
+}
+
+static std::string target_str(Target t) {
+    switch (t) {
+        case Target::ACCEPT:     return "ACCEPT";
+        case Target::DROP:       return "DROP";
+        case Target::REJECT:     return "REJECT";
+        case Target::LOG:        return "LOG";
+        case Target::MASQUERADE: return "MASQUERADE";
+        case Target::SNAT:       return "SNAT";
+        case Target::DNAT:       return "DNAT";
+        case Target::REDIRECT:   return "REDIRECT";
+    }
+    return "";
+}
+
+static std::string protocol_str(Protocol p) {
+    switch (p) {
+        case Protocol::TCP:  return "tcp";
+        case Protocol::UDP:  return "udp";
+        case Protocol::ICMP: return "icmp";
+        case Protocol::ALL:  return "all";
+    }
+    return "all";
+}
+
+CommandBuilder::CommandBuilder() { reset(); }
+
+CommandBuilder& CommandBuilder::action(Action a) { m_action = a; return *this; }
+CommandBuilder& CommandBuilder::chain(Chain c) { m_chain = c; return *this; }
+CommandBuilder& CommandBuilder::table(Table t) { m_table = t; return *this; }
+CommandBuilder& CommandBuilder::target(Target t) { m_target = t; return *this; }
+CommandBuilder& CommandBuilder::protocol(Protocol p) { m_protocol = p; return *this; }
+CommandBuilder& CommandBuilder::source(const std::string& ip) { m_source = ip; return *this; }
+CommandBuilder& CommandBuilder::destination(const std::string& ip) { m_dest = ip; return *this; }
+CommandBuilder& CommandBuilder::in_interface(const std::string& iface) { m_in_iface = iface; return *this; }
+CommandBuilder& CommandBuilder::out_interface(const std::string& iface) { m_out_iface = iface; return *this; }
+CommandBuilder& CommandBuilder::sport(int port) { m_sport = port; return *this; }
+CommandBuilder& CommandBuilder::dport(int port) { m_dport = port; return *this; }
+CommandBuilder& CommandBuilder::comment(const std::string& text) { m_comment = text; return *this; }
+
+void CommandBuilder::reset() {
+    m_action.reset();
+    m_chain.reset();
+    m_table = Table::FILTER;
+    m_target.reset();
+    m_protocol.reset();
+    m_source.clear();
+    m_dest.clear();
+    m_in_iface.clear();
+    m_out_iface.clear();
+    m_sport = -1;
+    m_dport = -1;
+    m_comment.clear();
+    m_error.clear();
+}
+
+bool CommandBuilder::validate() const {
+    m_error.clear();
+    
+    // Action is required
+    if (!m_action.has_value()) {
+        m_error = "Action required";
+        return false;
+    }
+    
+    // Chain required for most actions
+    Action a = m_action.value();
+    if (a != Action::SAVE && !m_chain.has_value()) {
+        m_error = "Chain required";
+        return false;
+    }
+    
+    // Target required for append/insert
+    if ((a == Action::APPEND || a == Action::INSERT) && !m_target.has_value()) {
+        m_error = "Target required for append/insert";
+        return false;
+    }
+    
+    // Validate source IP if provided
+    if (!m_source.empty()) {
+        auto result = SEC.validate(security::InputType::IP_CIDR, m_source);
+        if (!result.valid) {
+            m_error = "Invalid source IP/CIDR";
+            return false;
+        }
+    }
+    
+    // Validate dest IP if provided
+    if (!m_dest.empty()) {
+        auto result = SEC.validate(security::InputType::IP_CIDR, m_dest);
+        if (!result.valid) {
+            m_error = "Invalid destination IP/CIDR";
+            return false;
+        }
+    }
+    
+    // Validate interfaces if provided
+    if (!m_in_iface.empty() && SEC.safe_interface(m_in_iface).empty()) {
+        m_error = "Invalid input interface";
+        return false;
+    }
+    if (!m_out_iface.empty() && SEC.safe_interface(m_out_iface).empty()) {
+        m_error = "Invalid output interface";
+        return false;
+    }
+    
+    // Validate ports
+    if (m_sport > 0 && (m_sport < 1 || m_sport > 65535)) {
+        m_error = "Invalid source port";
+        return false;
+    }
+    if (m_dport > 0 && (m_dport < 1 || m_dport > 65535)) {
+        m_error = "Invalid destination port";
+        return false;
+    }
+    
+    // Ports require TCP or UDP
+    if ((m_sport > 0 || m_dport > 0) && !m_protocol.has_value()) {
+        m_error = "Port rules require TCP or UDP protocol";
+        return false;
+    }
+    if ((m_sport > 0 || m_dport > 0) && m_protocol.has_value()) {
+        Protocol p = m_protocol.value();
+        if (p != Protocol::TCP && p != Protocol::UDP) {
+            m_error = "Port rules require TCP or UDP protocol";
+            return false;
+        }
+    }
+    
+    return true;
+}
+
+std::string CommandBuilder::build() const {
+    if (!validate()) return "";
+    
+    std::ostringstream cmd;
+    cmd << "iptables -t " << table_str(m_table) << " ";
+    cmd << action_str(m_action.value()) << " ";
+    
+    if (m_chain.has_value()) {
+        cmd << chain_str(m_chain.value()) << " ";
+    }
+    
+    // Protocol
+    if (m_protocol.has_value()) {
+        cmd << "-p " << protocol_str(m_protocol.value()) << " ";
+    }
+    
+    // Source
+    if (!m_source.empty()) {
+        cmd << "-s " << SEC.validate(security::InputType::IP_CIDR, m_source).sanitized << " ";
+    }
+    
+    // Destination
+    if (!m_dest.empty()) {
+        cmd << "-d " << SEC.validate(security::InputType::IP_CIDR, m_dest).sanitized << " ";
+    }
+    
+    // Interfaces
+    if (!m_in_iface.empty()) {
+        cmd << "-i " << SEC.safe_interface(m_in_iface) << " ";
+    }
+    if (!m_out_iface.empty()) {
+        cmd << "-o " << SEC.safe_interface(m_out_iface) << " ";
+    }
+    
+    // Ports
+    if (m_sport > 0) {
+        cmd << "--sport " << m_sport << " ";
+    }
+    if (m_dport > 0) {
+        cmd << "--dport " << m_dport << " ";
+    }
+    
+    // Comment (sanitize - alphanumeric and basic punctuation only)
+    if (!m_comment.empty()) {
+        std::string safe_comment;
+        for (char c : m_comment) {
+            if (std::isalnum(c) || c == '-' || c == '_' || c == ' ' || c == '.') {
+                safe_comment += c;
+            }
+        }
+        if (!safe_comment.empty()) {
+            cmd << "-m comment --comment \"" << safe_comment << "\" ";
+        }
+    }
+    
+    // Target
+    if (m_target.has_value()) {
+        cmd << "-j " << target_str(m_target.value());
+    }
+    
+    return cmd.str();
+}
+
+bool CommandBuilder::execute() {
+    std::string cmd = build();
+    if (cmd.empty()) {
+        SEC.log_attempt("iptables_builder", "validation failed: " + m_error, false);
+        return false;
+    }
+    
+    auto result = SEC.exec(cmd, true);
+    if (result.code != 0) {
+        m_error = "Command failed: " + result.out;
+        return false;
+    }
+    return true;
+}
+
+bool CommandBuilder::dry_run() const {
+    std::string cmd = build();
+    if (cmd.empty()) {
+        SEC.log_attempt("iptables_builder_dry", "validation failed: " + m_error, false);
+        return false;
+    }
+    
+    SEC.log_attempt("iptables_builder_dry", "[DRY RUN] " + cmd, true);
+    return true;
+}
+
 } // namespace iptables
