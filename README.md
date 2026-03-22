@@ -119,9 +119,9 @@ src/
 ├── main.cpp              # Entry point + root elevation
 ├── app.cpp               # Main window + tab management
 ├── core/
-│   └── state.cpp         # Central async state manager
+│   ├── state.cpp         # Central async state manager
+│   └── security_manager.cpp  # ⚠️ CRITICAL: All input validation + secure exec
 ├── helpers/
-│   ├── exec.cpp          # Command execution wrapper
 │   └── async.hpp         # Async helper for non-blocking UI
 ├── net/
 │   ├── interfaces.cpp    # Network interface enumeration
@@ -136,8 +136,27 @@ src/
     └── ...
 ```
 
+### Security Architecture
+
+⚠️ **NetMan runs as root.** All user input flows through a centralized SecurityManager before any shell execution.
+
+```
+UI Input → net layer → SecurityManager.validate() → SEC.exec() → Shell
+                              ↓
+                        Audit Log (/tmp/netman/security.log)
+```
+
+**SecurityManager provides:**
+- **16 Input Validators** — Interface names, MAC addresses, IPs, paths, etc.
+- **Command Whitelist** — Only approved commands can execute
+- **Shell Injection Blocking** — Metacharacters (`;|&$` etc.) blocked globally
+- **Audit Logging** — All blocked attempts logged with timestamps
+
+See [SECURITY.md](docs/SECURITY.md) for full details.
+
 ### Design Principles
 
+- **Security First** — All I/O through SecurityManager, no exceptions
 - **Non-blocking UI** — All slow operations run in background threads
 - **Central State Manager** — Single source of truth with signal-based updates
 - **Modular** — Each feature is self-contained in its own module
