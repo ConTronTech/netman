@@ -68,6 +68,27 @@ static std::string trim(const std::string& s) {
     return r;
 }
 
+// Sanitize string for shell commands (prevent injection)
+static std::string shell_escape(const std::string& s) {
+    std::string result;
+    for (char c : s) {
+        // Only allow safe characters
+        if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == ' ') {
+            result += c;
+        }
+    }
+    return result;
+}
+
+// Safe stoi with default
+static int safe_stoi(const std::string& s, int def = 0) {
+    try {
+        return std::stoi(s);
+    } catch (...) {
+        return def;
+    }
+}
+
 std::vector<std::string> get_ap_capable_interfaces() {
     std::vector<std::string> result;
     std::vector<std::string> wifi_ifaces;
@@ -190,9 +211,9 @@ bool start(const Config& cfg) {
     auto nm_result = exec::run("nmcli device set " + cfg.interface + " managed no 2>&1");
     log("nmcli result: " + nm_result);
     
-    // Kill any wpa_supplicant on this interface
+    // Kill wpa_supplicant ONLY for this interface (not all!)
+    exec::run("pkill -f 'wpa_supplicant.*-i" + cfg.interface + "' 2>/dev/null");
     exec::run("pkill -f 'wpa_supplicant.*" + cfg.interface + "' 2>/dev/null");
-    exec::run("killall wpa_supplicant 2>/dev/null");
     
     // Small delay for processes to die
     exec::run("sleep 0.5");
@@ -310,10 +331,11 @@ bool stop() {
     // Kill hostapd
     if (std::filesystem::exists(HOSTAPD_PID)) {
         std::ifstream pf(HOSTAPD_PID);
-        std::string pid;
-        std::getline(pf, pid);
-        if (!pid.empty()) {
-            kill(std::stoi(pid), SIGTERM);
+        std::string pid_str;
+        std::getline(pf, pid_str);
+        int pid = safe_stoi(pid_str, 0);
+        if (pid > 0) {
+            kill(pid, SIGTERM);
         }
         std::filesystem::remove(HOSTAPD_PID);
     }
@@ -324,10 +346,11 @@ bool stop() {
     // Kill dnsmasq
     if (std::filesystem::exists(DNSMASQ_PID)) {
         std::ifstream pf(DNSMASQ_PID);
-        std::string pid;
-        std::getline(pf, pid);
-        if (!pid.empty()) {
-            kill(std::stoi(pid), SIGTERM);
+        std::string pid_str;
+        std::getline(pf, pid_str);
+        int pid = safe_stoi(pid_str, 0);
+        if (pid > 0) {
+            kill(pid, SIGTERM);
         }
         std::filesystem::remove(DNSMASQ_PID);
     }
@@ -375,16 +398,17 @@ bool is_running() {
     }
     
     std::ifstream pf(HOSTAPD_PID);
-    std::string pid;
-    std::getline(pf, pid);
+    std::string pid_str;
+    std::getline(pf, pid_str);
     
-    if (pid.empty()) {
+    int pid = safe_stoi(pid_str, 0);
+    if (pid <= 0) {
         s_running = false;
         return false;
     }
     
     // Check if process exists
-    if (kill(std::stoi(pid), 0) != 0) {
+    if (kill(pid, 0) != 0) {
         s_running = false;
         return false;
     }
@@ -543,6 +567,9 @@ std::vector<Client> get_clients() {
 bool enable_nat(const std::string& ap_iface, const std::string& wan_iface) {
     // Enable IP forwarding
     exec::run("echo 1 > /proc/sys/net/ipv4/ip_forward");
+    
+    // Remove existing rules first to prevent duplicates
+    disable_nat(ap_iface, wan_iface);
     
     // Setup NAT
     exec::run("iptables -t nat -A POSTROUTING -o " + wan_iface + " -j MASQUERADE");
