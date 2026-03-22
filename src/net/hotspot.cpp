@@ -369,9 +369,14 @@ bool start(const Config& cfg) {
     auto nm_result = SEC.exec("nmcli device set " + safe_iface + " managed no 2>&1", false).out;
     log("nmcli result: " + nm_result);
     
-    // Kill wpa_supplicant ONLY for this interface (not all!)
-    SEC.exec("pkill -f 'wpa_supplicant.*-i" + safe_iface + "' 2>/dev/null", false).out;
-    SEC.exec("pkill -f 'wpa_supplicant.*" + safe_iface + "' 2>/dev/null", false).out;
+    // Kill wpa_supplicant for this interface via PID file if exists
+    std::string wpa_pid_file = "/tmp/netman/wpa_" + safe_iface + ".pid";
+    if (std::filesystem::exists(wpa_pid_file)) {
+        SEC.exec("pkill -F " + wpa_pid_file, false);
+        std::filesystem::remove(wpa_pid_file);
+    }
+    // Also try systemctl as fallback (safer than grep-based pkill)
+    SEC.exec("systemctl stop wpa_supplicant", false);
     
     // Small delay for processes to die
     SEC.exec("sleep 0.5", false).out;
@@ -765,7 +770,7 @@ std::vector<Client> get_clients() {
 
 bool enable_nat(const std::string& ap_iface, const std::string& wan_iface) {
     // Enable IP forwarding
-    SEC.exec("echo 1 > /proc/sys/net/ipv4/ip_forward", false).out;
+    SEC.exec("sysctl -w net.ipv4.ip_forward=1", false).out;
     
     // Remove existing rules first to prevent duplicates
     disable_nat(ap_iface, wan_iface);

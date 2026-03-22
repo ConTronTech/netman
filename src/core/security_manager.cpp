@@ -48,43 +48,82 @@ static const std::vector<int> VALID_5GHZ_CHANNELS = {
 
 // Allowed root command prefixes - ONLY these can run with needs_root=true
 static const std::vector<std::string> ROOT_COMMAND_WHITELIST = {
-    // Network interface management
-    "ip link ",
-    "ip addr ",
-    "ip route ",
-    "ip neigh ",
-    // WiFi tools
-    "iw ",
-    "iwconfig ",
-    "iwlist ",
-    "iwgetid ",
-    "hostapd",
-    "wpa_supplicant",
-    // DHCP/DNS
-    "dnsmasq",
-    // Firewall
-    "iptables ",
-    "iptables-save",
-    "iptables-restore",
-    // Network manager
-    "nmcli ",
+    // === Network interface management (TIGHTENED) ===
+    // ip link: only show and set operations
+    "ip link show",
+    "ip link set ",          // Must be followed by validated interface
+    // ip addr: only show, add, del, flush
+    "ip addr show",
+    "ip addr add ",          // Adding IPs (validated)
+    "ip addr del ",          // Removing IPs (validated)
+    "ip addr flush dev ",    // Flush specific device only
+    "ip -4 addr show ",      // IPv4 specific
+    "ip -6 addr show ",      // IPv6 specific
+    // ip route: read-only
+    "ip route show",
+    "ip route get ",         // Query specific route
+    // ip neigh: read-only
+    "ip neigh show",
+    
+    // === WiFi tools (read + specific write ops) ===
+    "iw dev ",               // Device-specific commands
+    "iw phy ",               // Phy-specific commands  
+    "iw list",               // List capabilities (read-only)
+    "iw reg set ",           // Set regulatory domain
+    "iwconfig",              // Read-only when no args after interface
+    "iwlist ",               // Scan/list (read-only)
+    "iwgetid ",              // Get SSID (read-only)
+    
+    // === Hotspot services (restricted to our config dir) ===
+    "hostapd /tmp/netman/",              // Only our configs
+    "hostapd -B /tmp/netman/",           // Background mode
+    "hostapd -B -P /tmp/netman/",        // With PID file
+    "dnsmasq -C /tmp/netman/",           // Only our configs
+    "dnsmasq --conf-file=/tmp/netman/",  // Alternative syntax
+    "dnsmasq --pid-file=/tmp/netman/",   // PID file in our dir
+    "wpa_supplicant -c /tmp/netman/",    // Only our configs
+    
+    // === Firewall (TIGHTENED - specific actions only) ===
+    "iptables -A ",          // Append rule
+    "iptables -D ",          // Delete rule
+    "iptables -I ",          // Insert rule
+    "iptables -C ",          // Check rule exists
+    "iptables -L",           // List rules (read-only)
+    "iptables -S",           // Print rules (read-only)
+    "iptables -t nat -A ",   // NAT table append
+    "iptables -t nat -D ",   // NAT table delete
+    "iptables -t nat -I ",   // NAT table insert
+    "iptables -t nat -L",    // NAT table list
+    "iptables -t nat -S",    // NAT table print
+    "iptables-save",         // Export rules (read-only)
+    // NOTE: iptables-restore intentionally removed - too dangerous
+    
+    // === Network manager ===
+    "nmcli device ",         // Device management
+    "nmcli connection ",     // Connection management
+    "nmcli general ",        // General status
     "systemctl restart wpa_supplicant",
     "systemctl restart NetworkManager",
-    // Process management (scoped)
-    "pkill -f 'hostapd",
-    "pkill -f 'dnsmasq",
-    "pkill -f 'wpa_supplicant",
-    // Scanning
-    "arp-scan ",
-    // Process listing
-    "pgrep ",
-    // Utilities (timeout handled specially in exec_timeout, not here)
-    "cat /tmp/netman/",
-    "sleep ",
-    "echo 1 > /proc/sys/net/ipv4/ip_forward",
-    "echo 0 > /proc/sys/net/ipv4/ip_forward",
-    // Regulatory
-    "iw reg set ",
+    "systemctl stop hostapd",
+    "systemctl stop dnsmasq",
+    
+    // === Process management (PID file based - safer than grep) ===
+    "pkill -F /tmp/netman/",             // Kill by PID file only
+    "kill -TERM ",                        // Graceful kill (needs PID validation)
+    "kill -9 ",                           // Force kill (needs PID validation)
+    
+    // === Scanning ===
+    "arp-scan -l -I ",       // Local scan on specific interface
+    "pgrep -a ",             // Process grep with args
+    "pgrep -F ",             // PID file check
+    
+    // === Utilities ===
+    "cat /tmp/netman/",      // Read our files only
+    "sleep ",                // Delay (duration validated in code)
+    "sysctl -w net.ipv4.ip_forward=1",   // Enable forwarding
+    "sysctl -w net.ipv4.ip_forward=0",   // Disable forwarding
+    "which ",                // Check for binaries
+    "getent hosts ",         // DNS lookup
 };
 
 // Allowed log path prefixes
