@@ -1,5 +1,5 @@
 #include "interfaces.hpp"
-#include "../helpers/exec.hpp"
+#include "../core/security_manager.hpp"
 #include <fstream>
 #include <sstream>
 #include <filesystem>
@@ -10,7 +10,7 @@ namespace fs = std::filesystem;
 
 namespace interfaces {
 
-// Parse /proc/net/dev for RX/TX bytes
+// Parse /proc/net/dev for RX/TX bytes (no shell, safe)
 static void get_traffic_stats(const std::string& name, uint64_t& rx, uint64_t& tx) {
     rx = 0;
     tx = 0;
@@ -34,7 +34,9 @@ static void get_traffic_stats(const std::string& name, uint64_t& rx, uint64_t& t
 
 // Parse iwconfig for signal strength
 static int get_wifi_signal(const std::string& name) {
-    std::string output = exec::run("iwconfig " + name + " 2>/dev/null");
+    // Name already validated by caller
+    auto result = SEC.exec_timeout("iwconfig " + name + " 2>/dev/null", 5, false);
+    std::string output = result.out;
     
     // Look for "Signal level=-XX dBm" or "Link Quality=XX/70"
     std::regex signal_regex("Signal level[=:]\\s*(-?\\d+)");
@@ -42,17 +44,21 @@ static int get_wifi_signal(const std::string& name) {
     std::smatch match;
     
     if (std::regex_search(output, match, quality_regex)) {
-        int current = std::stoi(match[1]);
-        int max = std::stoi(match[2]);
-        return (current * 100) / max;
+        try {
+            int current = std::stoi(match[1]);
+            int max = std::stoi(match[2]);
+            if (max > 0) return (current * 100) / max;
+        } catch (...) {}
     }
     
     if (std::regex_search(output, match, signal_regex)) {
-        int dbm = std::stoi(match[1]);
-        // Convert dBm to percentage (rough approximation)
-        // -30 dBm = 100%, -90 dBm = 0%
-        int pct = (dbm + 90) * 100 / 60;
-        return std::clamp(pct, 0, 100);
+        try {
+            int dbm = std::stoi(match[1]);
+            // Convert dBm to percentage (rough approximation)
+            // -30 dBm = 100%, -90 dBm = 0%
+            int pct = (dbm + 90) * 100 / 60;
+            return std::clamp(pct, 0, 100);
+        } catch (...) {}
     }
     
     return -1; // Not a wifi interface
@@ -66,38 +72,58 @@ static Interface parse_interface(const std::string& name) {
     iface.rx_bytes = 0;
     iface.tx_bytes = 0;
     
-    // Get state from /sys
-    std::ifstream state_file("/sys/class/net/" + name + "/operstate");
-    if (state_file) {
-        std::getline(state_file, iface.state);
-        // Capitalize
-        std::transform(iface.state.begin(), iface.state.end(), 
-                       iface.state.begin(), ::toupper);
+    // Validate interface name
+    std::string safe_name = SEC.safe_interface(name);
+    if (safe_name.empty()) {
+        return iface;
     }
     
-    // Get MAC from /sys
-    std::ifstream mac_file("/sys/class/net/" + name + "/address");
-    if (mac_file) {
-        std::getline(mac_file, iface.mac);
-        // Uppercase MAC
-        std::transform(iface.mac.begin(), iface.mac.end(),
-                       iface.mac.begin(), ::toupper);
+    // Get state from /sys (file read, no shell)
+    std::string state_path = "/sys/class/net/" + safe_name + "/operstate";
+    if (fs::exists(state_path)) {
+        std::ifstream state_file(state_path);
+        if (state_file) {
+            std::getline(state_file, iface.state);
+            // Capitalize
+            std::transform(iface.state.begin(), iface.state.end(), 
+                           iface.state.begin(), ::toupper);
+        }
     }
     
-    // Get IP from ip addr
-    std::string output = exec::run("ip -4 addr show " + name + " 2>/dev/null");
+    // Get MAC from /sys (file read, no shell)
+    std::string mac_path = "/sys/class/net/" + safe_name + "/address";
+    if (fs::exists(mac_path)) {
+        std::ifstream mac_file(mac_path);
+        if (mac_file) {
+            std::string raw_mac;
+            std::getline(mac_file, raw_mac);
+            // Validate MAC before storing
+            std::string safe_mac = SEC.safe_mac(raw_mac);
+            if (!safe_mac.empty()) {
+                iface.mac = safe_mac;
+            }
+        }
+    }
+    
+    // Get IP from ip addr (shell command with validated input)
+    auto ip_result = SEC.exec_timeout("ip -4 addr show " + safe_name, 5, false);
     std::regex ip_regex("inet\\s+(\\d+\\.\\d+\\.\\d+\\.\\d+)");
     std::smatch match;
-    if (std::regex_search(output, match, ip_regex)) {
-        iface.ip = match[1];
+    if (std::regex_search(ip_result.out, match, ip_regex)) {
+        std::string ip_candidate = match[1];
+        // Validate IP before storing
+        std::string safe_ip = SEC.safe_ip(ip_candidate);
+        if (!safe_ip.empty()) {
+            iface.ip = safe_ip;
+        }
     }
     
-    // Get traffic stats
-    get_traffic_stats(name, iface.rx_bytes, iface.tx_bytes);
+    // Get traffic stats (file read, no shell)
+    get_traffic_stats(safe_name, iface.rx_bytes, iface.tx_bytes);
     
     // Get wifi signal if applicable
-    if (name.find("wl") == 0 || name.find("wifi") == 0) {
-        iface.signal = get_wifi_signal(name);
+    if (safe_name.find("wl") == 0 || safe_name.find("wifi") == 0) {
+        iface.signal = get_wifi_signal(safe_name);
     }
     
     return iface;
@@ -113,21 +139,28 @@ std::vector<Interface> list() {
             // Skip loopback
             if (name == "lo") continue;
             
-            result.push_back(parse_interface(name));
+            // Validate interface name before processing
+            std::string safe_name = SEC.safe_interface(name);
+            if (!safe_name.empty()) {
+                result.push_back(parse_interface(safe_name));
+            }
         }
     } catch (...) {
-        // Fallback: parse ip link
-        std::string output = exec::run("ip link show");
+        // Fallback: parse ip link (no user input, safe)
+        auto link_result = SEC.exec("ip link show", false);
         std::regex iface_regex("^\\d+:\\s+(\\w+):");
         std::smatch match;
-        std::istringstream iss(output);
+        std::istringstream iss(link_result.out);
         std::string line;
         
         while (std::getline(iss, line)) {
             if (std::regex_search(line, match, iface_regex)) {
                 std::string name = match[1];
                 if (name != "lo") {
-                    result.push_back(parse_interface(name));
+                    std::string safe_name = SEC.safe_interface(name);
+                    if (!safe_name.empty()) {
+                        result.push_back(parse_interface(safe_name));
+                    }
                 }
             }
         }
@@ -137,16 +170,27 @@ std::vector<Interface> list() {
 }
 
 Interface get(const std::string& name) {
-    return parse_interface(name);
+    std::string safe_name = SEC.safe_interface(name);
+    if (safe_name.empty()) {
+        return Interface{};
+    }
+    return parse_interface(safe_name);
 }
 
 bool set_state(const std::string& name, bool up) {
-    std::string cmd = "ip link set " + name + (up ? " up" : " down");
-    auto result = exec::run_root(cmd);
+    std::string safe_name = SEC.safe_interface(name);
+    if (safe_name.empty()) {
+        SEC.log_attempt("set_state", "invalid interface: " + name, false);
+        return false;
+    }
+    
+    std::string cmd = "ip link set " + safe_name + (up ? " up" : " down");
+    auto result = SEC.exec(cmd, true);
     return result.code == 0;
 }
 
 std::string get_dns() {
+    // File read, no shell, no user input
     std::ifstream file("/etc/resolv.conf");
     std::string line;
     
@@ -155,7 +199,11 @@ std::string get_dns() {
             std::istringstream iss(line);
             std::string ns, ip;
             iss >> ns >> ip;
-            return ip;
+            // Validate IP before returning
+            std::string safe_ip = SEC.safe_ip(ip);
+            if (!safe_ip.empty()) {
+                return safe_ip;
+            }
         }
     }
     
@@ -163,12 +211,18 @@ std::string get_dns() {
 }
 
 std::string get_default_gateway() {
-    std::string output = exec::run("ip route show default 2>/dev/null");
+    // No user input, safe command
+    auto result = SEC.exec("ip route show default", false);
     std::regex gw_regex("default via (\\d+\\.\\d+\\.\\d+\\.\\d+)");
     std::smatch match;
     
-    if (std::regex_search(output, match, gw_regex)) {
-        return match[1];
+    if (std::regex_search(result.out, match, gw_regex)) {
+        std::string gw_candidate = match[1];
+        // Validate IP before returning
+        std::string safe_ip = SEC.safe_ip(gw_candidate);
+        if (!safe_ip.empty()) {
+            return safe_ip;
+        }
     }
     
     return "";

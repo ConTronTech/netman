@@ -1,5 +1,5 @@
 #include "hotspot.hpp"
-#include "../helpers/exec.hpp"
+#include "../core/security_manager.hpp"
 #include <fstream>
 #include <sstream>
 #include <filesystem>
@@ -62,10 +62,10 @@ bool check_deps() {
 std::string get_missing_deps() {
     std::vector<std::string> missing;
     
-    if (exec::run("which hostapd 2>/dev/null").empty()) {
+    if (SEC.exec("which hostapd", false).out.empty()) {
         missing.push_back("hostapd");
     }
-    if (exec::run("which dnsmasq 2>/dev/null").empty()) {
+    if (SEC.exec("which dnsmasq", false).out.empty()) {
         missing.push_back("dnsmasq");
     }
     
@@ -88,16 +88,9 @@ static std::string trim(const std::string& s) {
     return r;
 }
 
-// Sanitize string for shell commands (prevent injection)
+// Use SecurityManager for all validation - these are thin wrappers for compatibility
 static std::string shell_escape(const std::string& s) {
-    std::string result;
-    for (char c : s) {
-        // Only allow safe characters
-        if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == ' ') {
-            result += c;
-        }
-    }
-    return result;
+    return SEC.safe_shell(s);
 }
 
 // Safe stoi with default
@@ -109,100 +102,50 @@ static int safe_stoi(const std::string& s, int def = 0) {
     }
 }
 
-// Valid country codes
-static const std::vector<std::string> VALID_COUNTRIES = {
-    "US", "CA", "GB", "DE", "FR", "AU", "JP", "CN", "FI", "NL",
-    "ES", "IT", "BR", "MX", "IN", "KR", "TW", "SG", "HK", "NZ"
-};
-
-// Validate country code (must be in whitelist)
+// Thin wrappers using SecurityManager
 static bool is_valid_country(const std::string& cc) {
-    for (const auto& valid : VALID_COUNTRIES) {
-        if (cc == valid) return true;
-    }
-    return false;
+    return SEC.validate(security::InputType::COUNTRY_CODE, cc).valid;
 }
 
-// Validate IP address format (proper check)
 static bool is_valid_ip(const std::string& ip) {
-    std::istringstream ss(ip);
-    std::string octet;
-    int count = 0;
-    
-    while (std::getline(ss, octet, '.')) {
-        if (octet.empty() || octet.length() > 3) return false;
-        for (char c : octet) {
-            if (!std::isdigit(c)) return false;
-        }
-        int val = std::stoi(octet);
-        if (val < 0 || val > 255) return false;
-        count++;
-    }
-    return count == 4;
+    return SEC.validate(security::InputType::IP_ADDRESS, ip).valid;
 }
 
-// Validate channel number
 static bool is_valid_channel(int ch, const std::string& band) {
-    if (band == "2.4") {
-        return ch >= 1 && ch <= 14;
-    } else if (band == "5") {
-        // Common 5GHz channels
-        static const std::vector<int> valid_5g = {36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144, 149, 153, 157, 161, 165};
-        return std::find(valid_5g.begin(), valid_5g.end(), ch) != valid_5g.end();
-    }
+    // SecurityManager validates channel standalone, we add band logic here
+    auto ch_result = SEC.validate(security::InputType::CHANNEL, std::to_string(ch));
+    if (!ch_result.valid) return false;
+    
+    if (band == "2.4") return ch >= 1 && ch <= 14;
+    if (band == "5") return ch >= 36;
     return false;
 }
 
-// Validate band
 static bool is_valid_band(const std::string& band) {
-    return band == "2.4" || band == "5";
+    return SEC.validate(security::InputType::BAND, band).valid;
 }
 
-// Sanitize for config file (remove newlines, control chars)
 static std::string config_escape(const std::string& s) {
-    std::string result;
-    for (char c : s) {
-        if (c >= 32 && c < 127) {  // Printable ASCII only
-            result += c;
-        }
-    }
-    return result;
+    // For config files, use SSID validation (printable ASCII)
+    auto result = SEC.validate(security::InputType::SSID, s);
+    return result.valid ? result.sanitized : "";
 }
 
-// Validate MAC address format
 static bool is_valid_mac(const std::string& mac) {
-    if (mac.length() != 17) return false;
-    for (int i = 0; i < 17; i++) {
-        if (i % 3 == 2) {
-            if (mac[i] != ':') return false;
-        } else {
-            if (!std::isxdigit(mac[i])) return false;
-        }
-    }
-    return true;
+    return SEC.validate(security::InputType::MAC_ADDRESS, mac).valid;
 }
 
-// Validate hostname (alphanumeric + hyphen, max 63 chars)
 static std::string sanitize_hostname(const std::string& h) {
-    std::string result;
-    for (char c : h) {
-        if (std::isalnum(c) || c == '-' || c == '.') {
-            result += c;
-        }
-        if (result.length() >= 63) break;
-    }
-    return result;
+    auto result = SEC.validate(security::InputType::HOSTNAME, h);
+    return result.valid ? result.sanitized : "";
 }
-
-// Thread-safe mutex for static state
-static std::mutex s_mutex;
 
 std::vector<std::string> get_ap_capable_interfaces() {
     std::vector<std::string> result;
     std::vector<std::string> wifi_ifaces;
     
     // Method 1: Check /sys/class/net/*/wireless (most reliable)
-    auto sys_output = exec::run("ls -d /sys/class/net/*/wireless 2>/dev/null | cut -d'/' -f5");
+    auto sys_output = SEC.exec("ls -d /sys/class/net/*/wireless 2>/dev/null | cut -d'/' -f5", false).out;
     std::istringstream sys_iss(sys_output);
     std::string iface;
     while (std::getline(sys_iss, iface)) {
@@ -214,7 +157,7 @@ std::vector<std::string> get_ap_capable_interfaces() {
     
     // Method 2: Fallback to iw dev
     if (wifi_ifaces.empty()) {
-        auto iw_output = exec::run("iw dev 2>/dev/null | grep Interface | awk '{print $2}'");
+        auto iw_output = SEC.exec("iw dev 2>/dev/null | grep Interface | awk '{print $2}'", false).out;
         std::istringstream iw_iss(iw_output);
         while (std::getline(iw_iss, iface)) {
             iface = trim(iface);
@@ -226,7 +169,7 @@ std::vector<std::string> get_ap_capable_interfaces() {
     
     // Method 3: Fallback to iwconfig
     if (wifi_ifaces.empty()) {
-        auto iwc_output = exec::run("iwconfig 2>/dev/null | grep -v 'no wireless' | grep -E '^[a-z]' | awk '{print $1}'");
+        auto iwc_output = SEC.exec("iwconfig 2>/dev/null | grep -v 'no wireless' | grep -E '^[a-z]' | awk '{print $1}'", false).out;
         std::istringstream iwc_iss(iwc_output);
         while (std::getline(iwc_iss, iface)) {
             iface = trim(iface);
@@ -242,7 +185,7 @@ std::vector<std::string> get_ap_capable_interfaces() {
         if (safe_wif.empty()) continue;  // Skip invalid names
         
         // Get phy number
-        auto phy = exec::run("iw dev " + safe_wif + " info 2>/dev/null | grep wiphy | awk '{print $2}'");
+        auto phy = SEC.exec("iw dev " + safe_wif + " info 2>/dev/null | grep wiphy | awk '{print $2}'", false).out;
         phy = trim(phy);
         
         if (phy.empty()) {
@@ -262,12 +205,12 @@ std::vector<std::string> get_ap_capable_interfaces() {
         }
         
         // Check for AP mode support
-        auto modes = exec::run("iw phy phy" + safe_phy + " info 2>/dev/null | grep -E '^\\s+\\* AP$'");
+        auto modes = SEC.exec("iw phy phy" + safe_phy + " info 2>/dev/null | grep -E '^\\s+\\* AP$'", false).out;
         if (!modes.empty()) {
             result.push_back(safe_wif);
         } else {
             // Broader check
-            modes = exec::run("iw phy phy" + safe_phy + " info 2>/dev/null | grep -i 'AP'");
+            modes = SEC.exec("iw phy phy" + safe_phy + " info 2>/dev/null | grep -i 'AP'", false).out;
             if (modes.find("* AP") != std::string::npos) {
                 result.push_back(safe_wif);
             } else {
@@ -285,7 +228,7 @@ bool supports_5ghz(const std::string& iface) {
     if (safe_iface.empty()) return true;  // Assume yes if can't check
     
     // Method 1: Check via iw phy
-    auto phy = exec::run("iw dev " + safe_iface + " info 2>/dev/null | grep wiphy | awk '{print $2}'");
+    auto phy = SEC.exec("iw dev " + safe_iface + " info 2>/dev/null | grep wiphy | awk '{print $2}'", false).out;
     phy = trim(phy);
     
     // Sanitize phy
@@ -296,16 +239,16 @@ bool supports_5ghz(const std::string& iface) {
     
     if (!safe_phy.empty()) {
         // Check for 5GHz frequencies (5000-5999 MHz)
-        auto freqs = exec::run("iw phy phy" + safe_phy + " info 2>/dev/null | grep -E '5[0-9]{3}'");
+        auto freqs = SEC.exec("iw phy phy" + safe_phy + " info 2>/dev/null | grep -E '5[0-9]{3}'", false).out;
         if (!freqs.empty()) return true;
         
         // Check for "Band 2" which is typically 5GHz
-        auto band = exec::run("iw phy phy" + safe_phy + " info 2>/dev/null | grep -i 'Band 2'");
+        auto band = SEC.exec("iw phy phy" + safe_phy + " info 2>/dev/null | grep -i 'Band 2'", false).out;
         if (!band.empty()) return true;
     }
     
     // Method 2: Check via iw list
-    auto iw_list = exec::run("iw list 2>/dev/null | grep -A 50 'Wiphy' | grep -E '5[0-9]{3}'");
+    auto iw_list = SEC.exec("iw list 2>/dev/null | grep -A 50 'Wiphy' | grep -E '5[0-9]{3}'", false).out;
     if (!iw_list.empty()) return true;
     
     // Method 3: Assume true if we can't determine (let hostapd fail gracefully)
@@ -386,39 +329,39 @@ bool start(const Config& cfg) {
     log("Releasing interface from NetworkManager...");
     
     // Stop NetworkManager from managing this interface
-    auto nm_result = exec::run("nmcli device set " + safe_iface + " managed no 2>&1");
+    auto nm_result = SEC.exec("nmcli device set " + safe_iface + " managed no 2>&1", false).out;
     log("nmcli result: " + nm_result);
     
     // Kill wpa_supplicant ONLY for this interface (not all!)
-    exec::run("pkill -f 'wpa_supplicant.*-i" + safe_iface + "' 2>/dev/null");
-    exec::run("pkill -f 'wpa_supplicant.*" + safe_iface + "' 2>/dev/null");
+    SEC.exec("pkill -f 'wpa_supplicant.*-i" + safe_iface + "' 2>/dev/null", false).out;
+    SEC.exec("pkill -f 'wpa_supplicant.*" + safe_iface + "' 2>/dev/null", false).out;
     
     // Small delay for processes to die
-    exec::run("sleep 0.5");
+    SEC.exec("sleep 0.5", false).out;
     
     // Bring down interface
     log("Bringing down interface...");
-    exec::run("ip link set " + safe_iface + " down");
-    exec::run("ip addr flush dev " + safe_iface);
+    SEC.exec("ip link set " + safe_iface + " down", false).out;
+    SEC.exec("ip addr flush dev " + safe_iface, false).out;
     
     // Set interface type
-    exec::run("iw dev " + safe_iface + " set type managed 2>/dev/null");
+    SEC.exec("iw dev " + safe_iface + " set type managed 2>/dev/null", false).out;
     
     // Set static IP for AP
     log("Setting IP " + cfg.ap_ip + "...");
-    auto ip_result = exec::run("ip addr add " + cfg.ap_ip + "/24 dev " + safe_iface + " 2>&1");
+    auto ip_result = SEC.exec("ip addr add " + cfg.ap_ip + "/24 dev " + safe_iface + " 2>&1", false).out;
     log("ip addr result: " + ip_result);
     
-    exec::run("ip link set " + safe_iface + " up");
+    SEC.exec("ip link set " + safe_iface + " up", false).out;
     
     // Verify interface is up
-    auto link_state = exec::run("ip link show " + safe_iface + " 2>&1");
+    auto link_state = SEC.exec("ip link show " + safe_iface + " 2>&1", false).out;
     log("Link state: " + link_state);
     
     // Set regulatory domain (required for 5GHz AP mode)
     log("Setting regulatory domain to " + cfg.country_code);
-    exec::run("iw reg set " + cfg.country_code + " 2>&1");
-    exec::run("sleep 0.3");
+    SEC.exec("iw reg set " + cfg.country_code + " 2>&1", false).out;
+    SEC.exec("sleep 0.3", false).out;
     
     // Generate hostapd config
     log("Writing hostapd config to " + HOSTAPD_CONF);
@@ -492,16 +435,16 @@ bool start(const Config& cfg) {
     log("Starting hostapd...");
     auto hostapd_cmd = "hostapd -B -P " + HOSTAPD_PID + " " + HOSTAPD_CONF + " 2>&1";
     log("Command: " + hostapd_cmd);
-    auto hostapd_result = exec::run(hostapd_cmd);
+    auto hostapd_result = SEC.exec(hostapd_cmd, false).out;
     log("hostapd output: " + hostapd_result);
     
     // Wait for it to start
-    exec::run("sleep 1");
+    SEC.exec("sleep 1", false).out;
     
     // Check if hostapd started
     if (!std::filesystem::exists(HOSTAPD_PID)) {
         // Try to get more info
-        auto ps = exec::run("ps aux | grep hostapd");
+        auto ps = SEC.exec("ps aux | grep hostapd", false).out;
         log("hostapd processes: " + ps);
         
         s_last_error = "hostapd failed to start: " + hostapd_result;
@@ -509,16 +452,16 @@ bool start(const Config& cfg) {
         return false;
     }
     
-    auto hostapd_pid = exec::run("cat " + HOSTAPD_PID);
+    auto hostapd_pid = SEC.exec("cat " + HOSTAPD_PID, false).out;
     log("hostapd started with PID: " + hostapd_pid);
     
     // Start dnsmasq
     log("Starting dnsmasq...");
-    auto dnsmasq_result = exec::run("dnsmasq -C " + DNSMASQ_CONF + " --pid-file=" + DNSMASQ_PID + " 2>&1");
+    auto dnsmasq_result = SEC.exec("dnsmasq -C " + DNSMASQ_CONF + " --pid-file=" + DNSMASQ_PID + " 2>&1", false).out;
     log("dnsmasq output: " + dnsmasq_result);
     
     // Verify dnsmasq started
-    exec::run("sleep 0.5");
+    SEC.exec("sleep 0.5", false).out;
     if (!std::filesystem::exists(DNSMASQ_PID)) {
         log("WARNING: dnsmasq may have failed to start");
         // Don't fail - hotspot can work without DHCP if clients use static IP
@@ -552,7 +495,7 @@ bool stop() {
     }
     
     // Also kill by name in case PID file is stale
-    exec::run("pkill -f 'hostapd.*netman' 2>/dev/null");
+    SEC.exec("pkill -f 'hostapd.*netman' 2>/dev/null", false).out;
     
     // Kill dnsmasq
     if (std::filesystem::exists(DNSMASQ_PID)) {
@@ -566,7 +509,7 @@ bool stop() {
         std::filesystem::remove(DNSMASQ_PID);
     }
     
-    exec::run("pkill -f 'dnsmasq.*netman' 2>/dev/null");
+    SEC.exec("pkill -f 'dnsmasq.*netman' 2>/dev/null", false).out;
     
     // Disable NAT (sanitize inputs)
     if (!s_current_config.share_from.empty()) {
@@ -581,20 +524,20 @@ bool stop() {
     // === Restore interface to NetworkManager ===
     if (!iface.empty()) {
         // Bring down and reset
-        exec::run("ip link set " + iface + " down 2>/dev/null");
-        exec::run("ip addr flush dev " + iface + " 2>/dev/null");
+        SEC.exec("ip link set " + iface + " down 2>/dev/null", false).out;
+        SEC.exec("ip addr flush dev " + iface + " 2>/dev/null", false).out;
         
         // Return to managed mode
-        exec::run("iw dev " + iface + " set type managed 2>/dev/null");
+        SEC.exec("iw dev " + iface + " set type managed 2>/dev/null", false).out;
         
         // Give back to NetworkManager
-        exec::run("nmcli device set " + iface + " managed yes 2>/dev/null");
+        SEC.exec("nmcli device set " + iface + " managed yes 2>/dev/null", false).out;
         
         // Restart wpa_supplicant for this interface
-        exec::run("systemctl restart wpa_supplicant 2>/dev/null");
+        SEC.exec("systemctl restart wpa_supplicant 2>/dev/null", false).out;
         
         // Bring interface back up
-        exec::run("ip link set " + iface + " up 2>/dev/null");
+        SEC.exec("ip link set " + iface + " up 2>/dev/null", false).out;
     }
     
     s_running = false;
@@ -651,7 +594,7 @@ std::vector<Client> get_clients() {
     
     // Try hostapd_cli first (comes with hostapd), then iw as fallback
     // Use timeout to prevent blocking
-    auto station_dump = exec::run("timeout 2 hostapd_cli -i " + iface + " all_sta 2>&1");
+    auto station_dump = SEC.exec("timeout 2 hostapd_cli -i " + iface + " all_sta 2>&1", false).out;
     
     // If hostapd_cli fails, try iw
     if (station_dump.empty() ||
@@ -660,7 +603,7 @@ std::vector<Client> get_clients() {
         station_dump.find("No such file") != std::string::npos ||
         station_dump.find("timed out") != std::string::npos) {
         log("hostapd_cli failed, trying iw");
-        station_dump = exec::run("timeout 2 /usr/sbin/iw dev " + iface + " station dump 2>&1");
+        station_dump = SEC.exec("timeout 2 /usr/sbin/iw dev " + iface + " station dump 2>&1", false).out;
     }
     
     log("station dump output:\n" + station_dump);
@@ -785,23 +728,23 @@ std::vector<Client> get_clients() {
 
 bool enable_nat(const std::string& ap_iface, const std::string& wan_iface) {
     // Enable IP forwarding
-    exec::run("echo 1 > /proc/sys/net/ipv4/ip_forward");
+    SEC.exec("echo 1 > /proc/sys/net/ipv4/ip_forward", false).out;
     
     // Remove existing rules first to prevent duplicates
     disable_nat(ap_iface, wan_iface);
     
     // Setup NAT
-    exec::run("iptables -t nat -A POSTROUTING -o " + wan_iface + " -j MASQUERADE");
-    exec::run("iptables -A FORWARD -i " + ap_iface + " -o " + wan_iface + " -j ACCEPT");
-    exec::run("iptables -A FORWARD -i " + wan_iface + " -o " + ap_iface + " -m state --state RELATED,ESTABLISHED -j ACCEPT");
+    SEC.exec("iptables -t nat -A POSTROUTING -o " + wan_iface + " -j MASQUERADE", false).out;
+    SEC.exec("iptables -A FORWARD -i " + ap_iface + " -o " + wan_iface + " -j ACCEPT", false).out;
+    SEC.exec("iptables -A FORWARD -i " + wan_iface + " -o " + ap_iface + " -m state --state RELATED,ESTABLISHED -j ACCEPT", false).out;
     
     return true;
 }
 
 bool disable_nat(const std::string& ap_iface, const std::string& wan_iface) {
-    exec::run("iptables -t nat -D POSTROUTING -o " + wan_iface + " -j MASQUERADE 2>/dev/null");
-    exec::run("iptables -D FORWARD -i " + ap_iface + " -o " + wan_iface + " -j ACCEPT 2>/dev/null");
-    exec::run("iptables -D FORWARD -i " + wan_iface + " -o " + ap_iface + " -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null");
+    SEC.exec("iptables -t nat -D POSTROUTING -o " + wan_iface + " -j MASQUERADE 2>/dev/null", false).out;
+    SEC.exec("iptables -D FORWARD -i " + ap_iface + " -o " + wan_iface + " -j ACCEPT 2>/dev/null", false).out;
+    SEC.exec("iptables -D FORWARD -i " + wan_iface + " -o " + ap_iface + " -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null", false).out;
     
     return true;
 }
@@ -812,11 +755,11 @@ std::vector<ChannelInfo> scan_channels(const std::string& iface) {
     log("Scanning channels on " + safe_iface);
     
     // Use iwlist or iw to scan
-    auto scan_output = exec::run("timeout 10 iwlist " + safe_iface + " scan 2>/dev/null");
+    auto scan_output = SEC.exec("timeout 10 iwlist " + safe_iface + " scan 2>/dev/null", false).out;
     
     if (scan_output.empty() || scan_output.find("not found") != std::string::npos) {
         // Try iw instead
-        scan_output = exec::run("timeout 10 /usr/sbin/iw dev " + safe_iface + " scan 2>/dev/null");
+        scan_output = SEC.exec("timeout 10 /usr/sbin/iw dev " + safe_iface + " scan 2>/dev/null", false).out;
     }
     
     // Count networks per channel
