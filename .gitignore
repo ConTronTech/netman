@@ -1,0 +1,22 @@
+# Build artifacts
+obj/
+netman
+*.o
+
+# Documentation (internal)
+PLAN.md
+PLAN_MAC_SPOOFER.md
+TODO_TOMORROW.md
+
+# Logs
+*.log
+
+# Editor
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# Debug
+/tmp/netman_*
