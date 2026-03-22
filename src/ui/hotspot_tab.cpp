@@ -275,12 +275,13 @@ void HotspotTab::refresh_clients() {
         }
     }
     
-    // Only rebuild UI if client list changed
+    // Only rebuild UI if client list changed (including signal)
     bool changed = (clients.size() != m_last_clients.size());
     if (!changed) {
         for (size_t i = 0; i < clients.size(); i++) {
             if (clients[i].mac != m_last_clients[i].mac ||
-                clients[i].ip != m_last_clients[i].ip) {
+                clients[i].ip != m_last_clients[i].ip ||
+                clients[i].signal != m_last_clients[i].signal) {
                 changed = true;
                 break;
             }
