@@ -76,6 +76,8 @@ static const std::vector<std::string> ROOT_COMMAND_WHITELIST = {
     "pkill -f 'wpa_supplicant",
     // Scanning
     "arp-scan ",
+    // Process listing
+    "pgrep ",
     // Utilities (timeout handled specially in exec_timeout, not here)
     "cat /tmp/netman/",
     "sleep ",

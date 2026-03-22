@@ -144,37 +144,48 @@ std::vector<std::string> get_ap_capable_interfaces() {
     std::vector<std::string> result;
     std::vector<std::string> wifi_ifaces;
     
-    // Method 1: Check /sys/class/net/*/wireless (most reliable)
-    auto sys_output = SEC.exec("ls -d /sys/class/net/*/wireless 2>/dev/null | cut -d'/' -f5", false).out;
-    std::istringstream sys_iss(sys_output);
-    std::string iface;
-    while (std::getline(sys_iss, iface)) {
-        iface = trim(iface);
-        if (!iface.empty()) {
-            wifi_ifaces.push_back(iface);
+    // Method 1: Check /sys/class/net directly (no shell pipes)
+    try {
+        for (const auto& entry : std::filesystem::directory_iterator("/sys/class/net")) {
+            std::string name = entry.path().filename().string();
+            // Check if wireless subdir exists
+            if (std::filesystem::exists(entry.path() / "wireless")) {
+                wifi_ifaces.push_back(name);
+            }
         }
-    }
+    } catch (...) {}
     
-    // Method 2: Fallback to iw dev
+    // Method 2: Fallback to iw dev (parse output in C++)
     if (wifi_ifaces.empty()) {
-        auto iw_output = SEC.exec("iw dev 2>/dev/null | grep Interface | awk '{print $2}'", false).out;
+        auto iw_output = SEC.exec("iw dev", false).out;
         std::istringstream iw_iss(iw_output);
-        while (std::getline(iw_iss, iface)) {
-            iface = trim(iface);
-            if (!iface.empty()) {
-                wifi_ifaces.push_back(iface);
+        std::string line;
+        while (std::getline(iw_iss, line)) {
+            // Look for "Interface wlan0" lines
+            size_t pos = line.find("Interface ");
+            if (pos != std::string::npos) {
+                std::string iface = trim(line.substr(pos + 10));
+                if (!iface.empty()) {
+                    wifi_ifaces.push_back(iface);
+                }
             }
         }
     }
     
-    // Method 3: Fallback to iwconfig
+    // Method 3: Fallback to iwconfig (parse output in C++)
     if (wifi_ifaces.empty()) {
-        auto iwc_output = SEC.exec("iwconfig 2>/dev/null | grep -v 'no wireless' | grep -E '^[a-z]' | awk '{print $1}'", false).out;
+        auto iwc_output = SEC.exec("iwconfig", false).out;
         std::istringstream iwc_iss(iwc_output);
-        while (std::getline(iwc_iss, iface)) {
-            iface = trim(iface);
-            if (!iface.empty()) {
-                wifi_ifaces.push_back(iface);
+        std::string line;
+        while (std::getline(iwc_iss, line)) {
+            // Lines starting with interface name (not whitespace) that don't say "no wireless"
+            if (!line.empty() && !std::isspace(line[0]) && line.find("no wireless") == std::string::npos) {
+                std::istringstream lss(line);
+                std::string iface;
+                lss >> iface;
+                if (!iface.empty()) {
+                    wifi_ifaces.push_back(iface);
+                }
             }
         }
     }
@@ -184,8 +195,14 @@ std::vector<std::string> get_ap_capable_interfaces() {
         std::string safe_wif = shell_escape(wif);
         if (safe_wif.empty()) continue;  // Skip invalid names
         
-        // Get phy number
-        auto phy = SEC.exec("iw dev " + safe_wif + " info 2>/dev/null | grep wiphy | awk '{print $2}'", false).out;
+        // Get phy number (parse iw output in C++)
+        auto iw_info = SEC.exec("iw dev " + safe_wif + " info", false).out;
+        std::string phy;
+        size_t wiphy_pos = iw_info.find("wiphy ");
+        if (wiphy_pos != std::string::npos) {
+            std::istringstream pss(iw_info.substr(wiphy_pos + 6));
+            pss >> phy;
+        }
         phy = trim(phy);
         
         if (phy.empty()) {
@@ -204,19 +221,13 @@ std::vector<std::string> get_ap_capable_interfaces() {
             continue;
         }
         
-        // Check for AP mode support
-        auto modes = SEC.exec("iw phy phy" + safe_phy + " info 2>/dev/null | grep -E '^\\s+\\* AP$'", false).out;
-        if (!modes.empty()) {
+        // Check for AP mode support (parse output in C++)
+        auto phy_info = SEC.exec("iw phy phy" + safe_phy + " info", false).out;
+        if (phy_info.find("* AP") != std::string::npos) {
             result.push_back(safe_wif);
         } else {
-            // Broader check
-            modes = SEC.exec("iw phy phy" + safe_phy + " info 2>/dev/null | grep -i 'AP'", false).out;
-            if (modes.find("* AP") != std::string::npos) {
-                result.push_back(safe_wif);
-            } else {
-                // Include anyway, let hostapd fail if it doesn't work
-                result.push_back(safe_wif);
-            }
+            // Include anyway, let hostapd fail if it doesn't work
+            result.push_back(safe_wif);
         }
     }
     
@@ -224,11 +235,17 @@ std::vector<std::string> get_ap_capable_interfaces() {
 }
 
 bool supports_5ghz(const std::string& iface) {
-    std::string safe_iface = shell_escape(iface);
+    std::string safe_iface = SEC.safe_interface(iface);
     if (safe_iface.empty()) return true;  // Assume yes if can't check
     
-    // Method 1: Check via iw phy
-    auto phy = SEC.exec("iw dev " + safe_iface + " info 2>/dev/null | grep wiphy | awk '{print $2}'", false).out;
+    // Get phy number (parse output in C++)
+    auto iw_info = SEC.exec("iw dev " + safe_iface + " info", false).out;
+    std::string phy;
+    size_t wiphy_pos = iw_info.find("wiphy ");
+    if (wiphy_pos != std::string::npos) {
+        std::istringstream pss(iw_info.substr(wiphy_pos + 6));
+        pss >> phy;
+    }
     phy = trim(phy);
     
     // Sanitize phy
@@ -238,20 +255,26 @@ bool supports_5ghz(const std::string& iface) {
     }
     
     if (!safe_phy.empty()) {
-        // Check for 5GHz frequencies (5000-5999 MHz)
-        auto freqs = SEC.exec("iw phy phy" + safe_phy + " info 2>/dev/null | grep -E '5[0-9]{3}'", false).out;
-        if (!freqs.empty()) return true;
-        
-        // Check for "Band 2" which is typically 5GHz
-        auto band = SEC.exec("iw phy phy" + safe_phy + " info 2>/dev/null | grep -i 'Band 2'", false).out;
-        if (!band.empty()) return true;
+        // Check for 5GHz frequencies (5000-5999 MHz) in phy info
+        auto phy_info = SEC.exec("iw phy phy" + safe_phy + " info", false).out;
+        // Look for frequencies in 5xxx range
+        if (phy_info.find("5180") != std::string::npos ||
+            phy_info.find("5240") != std::string::npos ||
+            phy_info.find("5745") != std::string::npos ||
+            phy_info.find("Band 2") != std::string::npos) {
+            return true;
+        }
     }
     
-    // Method 2: Check via iw list
-    auto iw_list = SEC.exec("iw list 2>/dev/null | grep -A 50 'Wiphy' | grep -E '5[0-9]{3}'", false).out;
-    if (!iw_list.empty()) return true;
+    // Method 2: Check via iw list (parse in C++)
+    auto iw_list = SEC.exec("iw list", false).out;
+    if (iw_list.find("5180") != std::string::npos ||
+        iw_list.find("5240") != std::string::npos ||
+        iw_list.find("5745") != std::string::npos) {
+        return true;
+    }
     
-    // Method 3: Assume true if we can't determine (let hostapd fail gracefully)
+    // Assume true if we can't determine (let hostapd fail gracefully)
     return true;
 }
 
@@ -457,8 +480,8 @@ bool start(const Config& cfg) {
     
     // Check if hostapd started
     if (!std::filesystem::exists(HOSTAPD_PID)) {
-        // Try to get more info
-        auto ps = SEC.exec("ps aux | grep hostapd", false).out;
+        // Try to get more info using pgrep (no pipes needed)
+        auto ps = SEC.exec("pgrep -a hostapd", false).out;
         log("hostapd processes: " + ps);
         
         s_last_error = "hostapd failed to start: " + hostapd_result;
