@@ -54,11 +54,23 @@ std::vector<Client> get_clients();
 bool enable_nat(const std::string& ap_iface, const std::string& wan_iface);
 bool disable_nat(const std::string& ap_iface, const std::string& wan_iface);
 
-// Config file paths
-const std::string HOSTAPD_CONF = "/tmp/netman_hostapd.conf";
-const std::string DNSMASQ_CONF = "/tmp/netman_dnsmasq.conf";
-const std::string HOSTAPD_PID = "/tmp/netman_hostapd.pid";
-const std::string DNSMASQ_PID = "/tmp/netman_dnsmasq.pid";
-const std::string DNSMASQ_LEASES = "/tmp/netman_dnsmasq.leases";
+// Config file paths (all in /tmp/netman/)
+const std::string NETMAN_DIR = "/tmp/netman";
+const std::string HOSTAPD_CONF = "/tmp/netman/hostapd.conf";
+const std::string DNSMASQ_CONF = "/tmp/netman/dnsmasq.conf";
+const std::string HOSTAPD_PID = "/tmp/netman/hostapd.pid";
+const std::string DNSMASQ_PID = "/tmp/netman/dnsmasq.pid";
+const std::string DNSMASQ_LEASES = "/tmp/netman/dnsmasq.leases";
+const std::string HOTSPOT_LOG = "/tmp/netman/hotspot.log";
+
+// Channel scanning
+struct ChannelInfo {
+    int channel;
+    int frequency;
+    int networks;  // Number of networks on this channel
+};
+
+std::vector<ChannelInfo> scan_channels(const std::string& iface);
+int find_best_channel(const std::string& iface, const std::string& band);
 
 } // namespace hotspot

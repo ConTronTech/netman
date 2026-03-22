@@ -174,6 +174,9 @@ void HotspotTab::on_band_changed() {
     
     std::string band = m_band_combo.get_active_id();
     
+    // Auto option first
+    m_channel_combo.append("auto", "Auto (least congested)");
+    
     if (band == "5") {
         // 5 GHz channels
         m_channel_combo.append("36", "36");
@@ -185,13 +188,19 @@ void HotspotTab::on_band_changed() {
         m_channel_combo.append("157", "157");
         m_channel_combo.append("161", "161");
     } else {
-        // 2.4 GHz channels
-        for (int i = 1; i <= 11; i++) {
-            m_channel_combo.append(std::to_string(i), std::to_string(i));
+        // 2.4 GHz non-overlapping channels first
+        m_channel_combo.append("1", "1");
+        m_channel_combo.append("6", "6");
+        m_channel_combo.append("11", "11");
+        // Then the rest
+        for (int i = 2; i <= 10; i++) {
+            if (i != 6) {
+                m_channel_combo.append(std::to_string(i), std::to_string(i));
+            }
         }
     }
     
-    m_channel_combo.set_active(0);
+    m_channel_combo.set_active(0);  // Default to Auto
 }
 
 void HotspotTab::refresh_status() {
@@ -353,10 +362,18 @@ void HotspotTab::on_start_clicked() {
     cfg.ssid = m_ssid_entry.get_text();
     cfg.password = pass;
     cfg.band = m_band_combo.get_active_id();
-    cfg.channel = std::stoi(m_channel_combo.get_active_id());
     cfg.country_code = m_country_combo.get_active_id();
     cfg.hidden = m_hidden_check.get_active();
     cfg.share_from = m_share_combo.get_active_id();
+    
+    // Handle auto channel selection
+    std::string channel_str = m_channel_combo.get_active_id();
+    if (channel_str == "auto") {
+        m_status_value.set_text("Scanning for best channel...");
+        cfg.channel = hotspot::find_best_channel(iface, cfg.band);
+    } else {
+        cfg.channel = std::stoi(channel_str);
+    }
     
     m_status_value.set_text("Starting...");
     m_start_btn.set_sensitive(false);

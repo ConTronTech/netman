@@ -7,6 +7,7 @@
 #include <iostream>
 #include <algorithm>
 #include <cctype>
+#include <map>
 
 namespace hotspot {
 
@@ -14,11 +15,17 @@ static Config s_current_config;
 static bool s_running = false;
 static std::string s_last_error;
 
+// Ensure netman directory exists
+static void ensure_dir() {
+    std::filesystem::create_directories(NETMAN_DIR);
+}
+
 // Debug log
 static std::ofstream s_log;
 static void log(const std::string& msg) {
+    ensure_dir();
     if (!s_log.is_open()) {
-        s_log.open("/tmp/netman_hotspot.log", std::ios::app);
+        s_log.open(HOTSPOT_LOG, std::ios::app);
     }
     s_log << "[" << time(nullptr) << "] " << msg << std::endl;
     s_log.flush();
@@ -551,6 +558,96 @@ bool disable_nat(const std::string& ap_iface, const std::string& wan_iface) {
     exec::run("iptables -D FORWARD -i " + wan_iface + " -o " + ap_iface + " -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null");
     
     return true;
+}
+
+std::vector<ChannelInfo> scan_channels(const std::string& iface) {
+    std::vector<ChannelInfo> result;
+    log("Scanning channels on " + iface);
+    
+    // Use iwlist or iw to scan
+    auto scan_output = exec::run("timeout 10 iwlist " + iface + " scan 2>/dev/null");
+    
+    if (scan_output.empty() || scan_output.find("not found") != std::string::npos) {
+        // Try iw instead
+        scan_output = exec::run("timeout 10 /usr/sbin/iw dev " + iface + " scan 2>/dev/null");
+    }
+    
+    // Count networks per channel
+    std::map<int, int> channel_counts;
+    
+    // Initialize common channels
+    // 2.4GHz: 1-11
+    for (int i = 1; i <= 11; i++) channel_counts[i] = 0;
+    // 5GHz common channels
+    for (int ch : {36, 40, 44, 48, 149, 153, 157, 161}) channel_counts[ch] = 0;
+    
+    std::istringstream ss(scan_output);
+    std::string line;
+    
+    while (std::getline(ss, line)) {
+        // iwlist format: "Channel:6"
+        size_t pos = line.find("Channel:");
+        if (pos != std::string::npos) {
+            try {
+                int ch = std::stoi(line.substr(pos + 8));
+                channel_counts[ch]++;
+            } catch (...) {}
+        }
+        // iw format: "DS Parameter set: channel 6"
+        pos = line.find("channel ");
+        if (pos != std::string::npos) {
+            try {
+                int ch = std::stoi(line.substr(pos + 8));
+                channel_counts[ch]++;
+            } catch (...) {}
+        }
+    }
+    
+    for (const auto& [ch, count] : channel_counts) {
+        ChannelInfo info;
+        info.channel = ch;
+        info.networks = count;
+        // Approximate frequency
+        if (ch <= 14) {
+            info.frequency = 2407 + ch * 5;
+        } else {
+            info.frequency = 5000 + ch * 5;
+        }
+        result.push_back(info);
+    }
+    
+    log("Found " + std::to_string(result.size()) + " channels");
+    return result;
+}
+
+int find_best_channel(const std::string& iface, const std::string& band) {
+    auto channels = scan_channels(iface);
+    
+    int best_channel = (band == "5") ? 36 : 6;  // Defaults
+    int min_networks = 999;
+    
+    for (const auto& ch : channels) {
+        // Filter by band
+        bool is_5ghz = (ch.channel >= 36);
+        if ((band == "5" && !is_5ghz) || (band == "2.4" && is_5ghz)) {
+            continue;
+        }
+        
+        // For 2.4GHz, prefer non-overlapping channels (1, 6, 11)
+        if (band == "2.4" && ch.channel != 1 && ch.channel != 6 && ch.channel != 11) {
+            continue;
+        }
+        
+        if (ch.networks < min_networks) {
+            min_networks = ch.networks;
+            best_channel = ch.channel;
+        }
+    }
+    
+    log("Best channel for " + band + "GHz: " + std::to_string(best_channel) + 
+        " (" + std::to_string(min_networks) + " networks)");
+    
+    return best_channel;
 }
 
 } // namespace hotspot
