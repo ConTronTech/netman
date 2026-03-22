@@ -9,6 +9,8 @@
 #include <cctype>
 #include <map>
 #include <mutex>
+#include <thread>
+#include <chrono>
 
 namespace hotspot {
 
@@ -88,11 +90,6 @@ static std::string trim(const std::string& s) {
     return r;
 }
 
-// Use SecurityManager for all validation - these are thin wrappers for compatibility
-static std::string shell_escape(const std::string& s) {
-    return SEC.safe_shell(s);
-}
-
 // Safe stoi with default
 static int safe_stoi(const std::string& s, int def = 0) {
     try {
@@ -123,12 +120,6 @@ static bool is_valid_channel(int ch, const std::string& band) {
 
 static bool is_valid_band(const std::string& band) {
     return SEC.validate(security::InputType::BAND, band).valid;
-}
-
-static std::string config_escape(const std::string& s) {
-    // For config files, use SSID validation (printable ASCII)
-    auto result = SEC.validate(security::InputType::SSID, s);
-    return result.valid ? result.sanitized : "";
 }
 
 static bool is_valid_mac(const std::string& mac) {
@@ -192,7 +183,7 @@ std::vector<std::string> get_ap_capable_interfaces() {
     
     // Check each interface for AP mode support
     for (const auto& wif : wifi_ifaces) {
-        std::string safe_wif = shell_escape(wif);
+        std::string safe_wif = SEC.safe_interface(wif);
         if (safe_wif.empty()) continue;  // Skip invalid names
         
         // Get phy number (parse iw output in C++)
@@ -522,41 +513,34 @@ bool start(const Config& cfg) {
 }
 
 bool stop() {
-    std::string iface = shell_escape(s_current_config.interface);
+    std::string safe_iface = SEC.safe_interface(s_current_config.interface);
     
-    // Kill hostapd
+    // Kill hostapd via PID file (the ONLY safe way)
     if (std::filesystem::exists(HOSTAPD_PID)) {
-        std::ifstream pf(HOSTAPD_PID);
-        std::string pid_str;
-        std::getline(pf, pid_str);
-        int pid = safe_stoi(pid_str, 0);
-        if (pid > 0) {
-            kill(pid, SIGTERM);
-        }
+        // Use pkill -F which reads PID from file
+        SEC.exec("pkill -F " + HOSTAPD_PID, false);
+        // Small delay for process to die
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        // Clean up PID file
         std::filesystem::remove(HOSTAPD_PID);
     }
+    // Fallback: use systemctl (no pattern matching)
+    SEC.exec("systemctl stop hostapd", false);
     
-    // Also kill by name in case PID file is stale
-    SEC.exec("pkill -f 'hostapd.*netman' 2>/dev/null", false).out;
-    
-    // Kill dnsmasq
+    // Kill dnsmasq via PID file
     if (std::filesystem::exists(DNSMASQ_PID)) {
-        std::ifstream pf(DNSMASQ_PID);
-        std::string pid_str;
-        std::getline(pf, pid_str);
-        int pid = safe_stoi(pid_str, 0);
-        if (pid > 0) {
-            kill(pid, SIGTERM);
-        }
+        SEC.exec("pkill -F " + DNSMASQ_PID, false);
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
         std::filesystem::remove(DNSMASQ_PID);
     }
-    
-    SEC.exec("pkill -f 'dnsmasq.*netman' 2>/dev/null", false).out;
+    SEC.exec("systemctl stop dnsmasq", false);
     
     // Disable NAT (sanitize inputs)
     if (!s_current_config.share_from.empty()) {
-        std::string safe_share = shell_escape(s_current_config.share_from);
-        disable_nat(iface, safe_share);
+        std::string safe_share = SEC.safe_interface(s_current_config.share_from);
+        if (!safe_share.empty()) {
+            disable_nat(safe_iface, safe_share);
+        }
     }
     
     // Cleanup config files
@@ -564,22 +548,22 @@ bool stop() {
     std::filesystem::remove(DNSMASQ_CONF);
     
     // === Restore interface to NetworkManager ===
-    if (!iface.empty()) {
+    if (!safe_iface.empty()) {
         // Bring down and reset
-        SEC.exec("ip link set " + iface + " down 2>/dev/null", false).out;
-        SEC.exec("ip addr flush dev " + iface + " 2>/dev/null", false).out;
+        SEC.exec("ip link set " + safe_iface + " down", false);
+        SEC.exec("ip addr flush dev " + safe_iface, false);
         
         // Return to managed mode
-        SEC.exec("iw dev " + iface + " set type managed 2>/dev/null", false).out;
+        SEC.exec("iw dev " + safe_iface + " set type managed", false);
         
         // Give back to NetworkManager
-        SEC.exec("nmcli device set " + iface + " managed yes 2>/dev/null", false).out;
+        SEC.exec("nmcli device set " + safe_iface + " managed yes", false);
         
-        // Restart wpa_supplicant for this interface
-        SEC.exec("systemctl restart wpa_supplicant 2>/dev/null", false).out;
+        // Restart wpa_supplicant
+        SEC.exec("systemctl restart wpa_supplicant", false);
         
         // Bring interface back up
-        SEC.exec("ip link set " + iface + " up 2>/dev/null", false).out;
+        SEC.exec("ip link set " + safe_iface + " up", false);
     }
     
     s_running = false;
@@ -631,12 +615,12 @@ std::vector<Client> get_clients() {
     
     if (!is_running()) return result;
     
-    std::string iface = shell_escape(s_current_config.interface);
-    log("get_clients: interface = " + iface);
+    std::string safe_iface = SEC.safe_interface(s_current_config.interface);
+    if (safe_iface.empty()) return result;
+    log("get_clients: interface = " + safe_iface);
     
     // Try hostapd_cli first (comes with hostapd), then iw as fallback
-    // Use timeout to prevent blocking
-    auto station_dump = SEC.exec("timeout 2 hostapd_cli -i " + iface + " all_sta 2>&1", false).out;
+    auto station_dump = SEC.exec_timeout("hostapd_cli -i " + safe_iface + " all_sta", 2, false).out;
     
     // If hostapd_cli fails, try iw
     if (station_dump.empty() ||
@@ -645,7 +629,7 @@ std::vector<Client> get_clients() {
         station_dump.find("No such file") != std::string::npos ||
         station_dump.find("timed out") != std::string::npos) {
         log("hostapd_cli failed, trying iw");
-        station_dump = SEC.exec("timeout 2 /usr/sbin/iw dev " + iface + " station dump 2>&1", false).out;
+        station_dump = SEC.exec_timeout("iw dev " + safe_iface + " station dump", 2, false).out;
     }
     
     log("station dump output:\n" + station_dump);
@@ -793,15 +777,16 @@ bool disable_nat(const std::string& ap_iface, const std::string& wan_iface) {
 
 std::vector<ChannelInfo> scan_channels(const std::string& iface) {
     std::vector<ChannelInfo> result;
-    std::string safe_iface = shell_escape(iface);
+    std::string safe_iface = SEC.safe_interface(iface);
+    if (safe_iface.empty()) return result;
     log("Scanning channels on " + safe_iface);
     
     // Use iwlist or iw to scan
-    auto scan_output = SEC.exec("timeout 10 iwlist " + safe_iface + " scan 2>/dev/null", false).out;
+    auto scan_output = SEC.exec_timeout("iwlist " + safe_iface + " scan", 10, false).out;
     
     if (scan_output.empty() || scan_output.find("not found") != std::string::npos) {
         // Try iw instead
-        scan_output = SEC.exec("timeout 10 /usr/sbin/iw dev " + safe_iface + " scan 2>/dev/null", false).out;
+        scan_output = SEC.exec_timeout("iw dev " + safe_iface + " scan", 10, false).out;
     }
     
     // Count networks per channel

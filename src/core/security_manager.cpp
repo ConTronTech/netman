@@ -78,6 +78,7 @@ static const std::vector<std::string> ROOT_COMMAND_WHITELIST = {
     "hostapd /tmp/netman/",              // Only our configs
     "hostapd -B /tmp/netman/",           // Background mode
     "hostapd -B -P /tmp/netman/",        // With PID file
+    "hostapd_cli -i ",                   // Query hostapd for station info
     "dnsmasq -C /tmp/netman/",           // Only our configs
     "dnsmasq --conf-file=/tmp/netman/",  // Alternative syntax
     "dnsmasq --pid-file=/tmp/netman/",   // PID file in our dir
