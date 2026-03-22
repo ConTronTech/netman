@@ -757,6 +757,7 @@ static bool has_shell_injection(const std::string& cmd) {
 }
 
 // Safe user commands - READ-ONLY operations only
+// NOTE: "timeout" deliberately NOT included - handled specially in exec_timeout()
 static const std::vector<std::string> SAFE_USER_COMMANDS = {
     "which ",
     "ls -",         // ls with flags only, not arbitrary paths
@@ -771,7 +772,6 @@ static const std::vector<std::string> SAFE_USER_COMMANDS = {
     "curl -s --connect-timeout",  // Specific safe curl pattern
     "getent hosts ",
     "sleep ",
-    "timeout ",
     "ping -c ",     // Only controlled pings
 };
 
