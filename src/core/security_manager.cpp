@@ -109,21 +109,23 @@ static const std::vector<std::string> SENSITIVE_PATTERNS = {
 
 struct SecurityManager::Impl {
     std::mutex log_mutex;
-    std::mutex exec_mutex;
     std::string log_path = "/tmp/netman/security.log";
     bool strict_mode = false;
     std::vector<std::string> recent_log;
     bool is_root_cached = false;
     bool is_root_checked = false;
+    bool log_file_created = false;
     
     void log(const std::string& msg) {
         std::lock_guard<std::mutex> lock(log_mutex);
         
-        // Timestamp
+        // Thread-safe timestamp using localtime_r
         auto now = std::chrono::system_clock::now();
         auto time = std::chrono::system_clock::to_time_t(now);
+        struct tm tm_buf;
+        localtime_r(&time, &tm_buf);
         char buf[32];
-        std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", std::localtime(&time));
+        std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tm_buf);
         
         std::string entry = std::string(buf) + " " + msg;
         
@@ -139,9 +141,12 @@ struct SecurityManager::Impl {
             std::ofstream f(log_path, std::ios::app);
             if (f) {
                 f << entry << "\n";
-                // Set restrictive permissions
-                std::filesystem::permissions(log_path,
-                    std::filesystem::perms::owner_read | std::filesystem::perms::owner_write);
+                // Set restrictive permissions only on first creation
+                if (!log_file_created) {
+                    std::filesystem::permissions(log_path,
+                        std::filesystem::perms::owner_read | std::filesystem::perms::owner_write);
+                    log_file_created = true;
+                }
             }
         } catch (...) {}
     }
@@ -241,6 +246,12 @@ ValidationResult SecurityManager::validate_mac(const std::string& input) {
 
 ValidationResult SecurityManager::validate_ip(const std::string& input) {
     // IPv4: 0-255.0-255.0-255.0-255
+    // Max length: 15 chars (255.255.255.255)
+    if (input.length() > 15) {
+        log_attempt("validate_ip", input, false);
+        return {false, "", "IP address too long"};
+    }
+    
     std::istringstream ss(input);
     std::string octet;
     int count = 0;
@@ -259,7 +270,14 @@ ValidationResult SecurityManager::validate_ip(const std::string& input) {
             }
         }
         
-        int val = std::stoi(octet);
+        int val;
+        try {
+            val = std::stoi(octet);
+        } catch (...) {
+            log_attempt("validate_ip", input, false);
+            return {false, "", "Invalid IP address octet"};
+        }
+        
         if (val < 0 || val > 255) {
             log_attempt("validate_ip", input, false);
             return {false, "", "IP address octet out of range"};
@@ -280,6 +298,12 @@ ValidationResult SecurityManager::validate_ip(const std::string& input) {
 
 ValidationResult SecurityManager::validate_ip_cidr(const std::string& input) {
     // IPv4/CIDR: 192.168.1.0/24
+    // Max length: 18 chars (255.255.255.255/32)
+    if (input.length() > 18) {
+        log_attempt("validate_ip_cidr", input, false);
+        return {false, "", "IP/CIDR too long"};
+    }
+    
     size_t slash = input.find('/');
     if (slash == std::string::npos) {
         return validate_ip(input);  // Plain IP is valid
@@ -306,7 +330,14 @@ ValidationResult SecurityManager::validate_ip_cidr(const std::string& input) {
         }
     }
     
-    int cidr = std::stoi(cidr_part);
+    int cidr;
+    try {
+        cidr = std::stoi(cidr_part);
+    } catch (...) {
+        log_attempt("validate_ip_cidr", input, false);
+        return {false, "", "Invalid CIDR value"};
+    }
+    
     if (cidr < 0 || cidr > 32) {
         log_attempt("validate_ip_cidr", input, false);
         return {false, "", "CIDR must be 0-32"};
@@ -332,6 +363,26 @@ ValidationResult SecurityManager::validate_hostname(const std::string& input) {
     if (sanitized.empty()) {
         log_attempt("validate_hostname", input, false);
         return {false, "", "Hostname contains only invalid characters"};
+    }
+    
+    // Structural validation: must have at least one alnum, can't be all dots/hyphens
+    bool has_alnum = false;
+    for (char c : sanitized) {
+        if (std::isalnum(c)) {
+            has_alnum = true;
+            break;
+        }
+    }
+    if (!has_alnum) {
+        log_attempt("validate_hostname", input, false);
+        return {false, "", "Hostname must contain alphanumeric characters"};
+    }
+    
+    // Can't start or end with hyphen or dot
+    if (sanitized.front() == '-' || sanitized.front() == '.' ||
+        sanitized.back() == '-' || sanitized.back() == '.') {
+        log_attempt("validate_hostname", input, false);
+        return {false, "", "Hostname cannot start or end with hyphen or dot"};
     }
     
     return {true, sanitized, ""};
@@ -444,6 +495,12 @@ ValidationResult SecurityManager::validate_port(const std::string& input) {
         return {false, "", "Port cannot be empty"};
     }
     
+    // Max 5 digits (65535)
+    if (input.length() > 5) {
+        log_attempt("validate_port", input, false);
+        return {false, "", "Port number too long"};
+    }
+    
     for (char c : input) {
         if (!std::isdigit(c)) {
             log_attempt("validate_port", input, false);
@@ -451,7 +508,14 @@ ValidationResult SecurityManager::validate_port(const std::string& input) {
         }
     }
     
-    int port = std::stoi(input);
+    int port;
+    try {
+        port = std::stoi(input);
+    } catch (...) {
+        log_attempt("validate_port", input, false);
+        return {false, "", "Invalid port number"};
+    }
+    
     if (port < 1 || port > 65535) {
         log_attempt("validate_port", input, false);
         return {false, "", "Port must be 1-65535"};
@@ -526,6 +590,12 @@ ValidationResult SecurityManager::validate_channel(const std::string& input) {
         return {false, "", "Channel cannot be empty"};
     }
     
+    // Max 3 digits (165 is highest valid channel)
+    if (input.length() > 3) {
+        log_attempt("validate_channel", input, false);
+        return {false, "", "Channel number too long"};
+    }
+    
     for (char c : input) {
         if (!std::isdigit(c)) {
             log_attempt("validate_channel", input, false);
@@ -533,7 +603,13 @@ ValidationResult SecurityManager::validate_channel(const std::string& input) {
         }
     }
     
-    int ch = std::stoi(input);
+    int ch;
+    try {
+        ch = std::stoi(input);
+    } catch (...) {
+        log_attempt("validate_channel", input, false);
+        return {false, "", "Invalid channel number"};
+    }
     
     // 2.4GHz: 1-14, 5GHz: check list
     bool valid = (ch >= 1 && ch <= 14);
@@ -665,23 +741,68 @@ bool SecurityManager::can_elevate() {
 // SECURE EXECUTION
 // =============================================================================
 
-// Check if command matches whitelist
+// Shell metacharacters that enable command chaining/injection
+static const std::string SHELL_METACHARACTERS = ";|&`$(){}[]<>!\n\r\\";
+
+// Check if command contains dangerous shell metacharacters
+static bool has_shell_injection(const std::string& cmd) {
+    for (char c : cmd) {
+        if (SHELL_METACHARACTERS.find(c) != std::string::npos) {
+            return true;
+        }
+    }
+    // Also check for common injection patterns
+    if (cmd.find("$(") != std::string::npos) return true;
+    if (cmd.find("${") != std::string::npos) return true;
+    return false;
+}
+
+// Safe user commands - READ-ONLY operations only
+static const std::vector<std::string> SAFE_USER_COMMANDS = {
+    "which ",
+    "ls -",         // ls with flags only, not arbitrary paths
+    "ip link show",
+    "ip addr show",
+    "ip route show",
+    "ip neigh show",
+    "iw dev ",      // iw dev X info/scan (read-only subcommands validated separately)
+    "iwconfig ",
+    "iwlist ",
+    "iwgetid ",
+    "curl -s --connect-timeout",  // Specific safe curl pattern
+    "getent hosts ",
+    "sleep ",
+    "timeout ",
+    "ping -c ",     // Only controlled pings
+};
+
+// Check if command matches whitelist AND has no injection
 static bool is_command_allowed(const std::string& cmd, bool needs_root) {
-    // Non-root commands: allow common safe commands
-    if (!needs_root) {
-        // Allow read-only / info commands without root
-        static const std::vector<std::string> SAFE_USER_COMMANDS = {
-            "which ", "cat ", "ls ", "ip ", "iw ", "iwconfig ", "iwlist ",
-            "iwgetid ", "ping ", "curl ", "getent ", "sleep ", "timeout ",
-        };
+    // FIRST: Block any command with shell metacharacters
+    if (has_shell_injection(cmd)) {
+        return false;
+    }
+    
+    // SECOND: Enforce max command length (prevent buffer issues)
+    if (cmd.length() > 1024) {
+        return false;
+    }
+    
+    // THIRD: Check against appropriate whitelist
+    const std::vector<std::string>* whitelist = nullptr;
+    
+    if (needs_root) {
+        whitelist = &ROOT_COMMAND_WHITELIST;
+    } else {
+        // For non-root, check safe user commands first
         for (const auto& prefix : SAFE_USER_COMMANDS) {
             if (cmd.find(prefix) == 0) return true;
         }
-        // Also allow anything in root whitelist for non-root (will fail if needs elevation)
+        // Fall through to root whitelist (commands that work without root too)
+        whitelist = &ROOT_COMMAND_WHITELIST;
     }
     
-    // Check root whitelist
-    for (const auto& prefix : ROOT_COMMAND_WHITELIST) {
+    for (const auto& prefix : *whitelist) {
         if (cmd.find(prefix) == 0) return true;
     }
     
