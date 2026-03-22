@@ -1,5 +1,5 @@
 #include "mac_spoofer.hpp"
-#include "../helpers/exec.hpp"
+#include "../core/security_manager.hpp"
 #include <random>
 #include <sstream>
 #include <iomanip>
@@ -9,17 +9,20 @@
 #include <chrono>
 #include <ctime>
 #include <algorithm>
+#include <mutex>
+#include <filesystem>
 
 namespace mac_spoofer {
 
-// Static storage
-static std::map<std::string, std::string> original_macs;
-static std::vector<SpoofEvent> history;
-static std::atomic<bool> monitoring{false};
-static std::thread monitor_thread;
+// Static storage with thread safety
+static std::map<std::string, std::string> s_original_macs;
+static std::vector<SpoofEvent> s_history;
+static std::atomic<bool> s_monitoring{false};
+static std::thread s_monitor_thread;
+static std::mutex s_state_mutex;
 
 // Vendor prefixes (common ones)
-static std::vector<VendorPrefix> vendors = {
+static std::vector<VendorPrefix> s_vendors = {
     {"Apple", "00:1C:B3"},
     {"Apple", "3C:06:30"},
     {"Samsung", "00:1A:8A"},
@@ -40,31 +43,56 @@ static std::vector<VendorPrefix> vendors = {
 };
 
 std::vector<VendorPrefix> get_vendors() {
-    return vendors;
+    return s_vendors;
 }
 
 std::string get_current_mac(const std::string& iface) {
-    std::ifstream file("/sys/class/net/" + iface + "/address");
+    // Validate interface name to prevent path traversal
+    std::string safe_iface = SEC.safe_interface(iface);
+    if (safe_iface.empty()) return "";
+    
+    // Read from /sys (no shell execution)
+    std::string path = "/sys/class/net/" + safe_iface + "/address";
+    
+    // Verify path is under /sys/class/net (defense in depth)
+    if (!std::filesystem::exists(path)) return "";
+    
+    std::ifstream file(path);
     std::string mac;
     if (file) {
         std::getline(file, mac);
-        std::transform(mac.begin(), mac.end(), mac.begin(), ::toupper);
+        // Validate the MAC we read
+        auto result = SEC.validate(security::InputType::MAC_ADDRESS, mac);
+        if (result.valid) {
+            return result.sanitized;
+        }
     }
-    return mac;
+    return "";
 }
 
 std::string get_original_mac(const std::string& iface) {
-    auto it = original_macs.find(iface);
-    if (it != original_macs.end()) {
+    std::string safe_iface = SEC.safe_interface(iface);
+    if (safe_iface.empty()) return "";
+    
+    std::lock_guard<std::mutex> lock(s_state_mutex);
+    auto it = s_original_macs.find(safe_iface);
+    if (it != s_original_macs.end()) {
         return it->second;
     }
     // Not stored yet, current is original
-    return get_current_mac(iface);
+    return get_current_mac(safe_iface);
 }
 
 void store_original_mac(const std::string& iface) {
-    if (original_macs.find(iface) == original_macs.end()) {
-        original_macs[iface] = get_current_mac(iface);
+    std::string safe_iface = SEC.safe_interface(iface);
+    if (safe_iface.empty()) return;
+    
+    std::lock_guard<std::mutex> lock(s_state_mutex);
+    if (s_original_macs.find(safe_iface) == s_original_macs.end()) {
+        std::string mac = get_current_mac(safe_iface);
+        if (!mac.empty()) {
+            s_original_macs[safe_iface] = mac;
+        }
     }
 }
 
@@ -89,7 +117,7 @@ std::string generate_random_mac() {
 std::string generate_vendor_mac(const std::string& vendor) {
     // Find vendor prefix
     std::string prefix;
-    for (const auto& v : vendors) {
+    for (const auto& v : s_vendors) {
         if (v.name == vendor && !v.prefix.empty()) {
             prefix = v.prefix;
             break;
@@ -115,38 +143,47 @@ std::string generate_vendor_mac(const std::string& vendor) {
 }
 
 bool is_valid_mac(const std::string& mac) {
-    if (mac.length() != 17) return false;
-    
-    for (int i = 0; i < 17; i++) {
-        if (i % 3 == 2) {
-            if (mac[i] != ':') return false;
-        } else {
-            if (!std::isxdigit(mac[i])) return false;
-        }
-    }
-    return true;
+    auto result = SEC.validate(security::InputType::MAC_ADDRESS, mac);
+    return result.valid;
 }
 
 bool apply_mac(const std::string& iface, const std::string& new_mac) {
-    // Store original first
-    store_original_mac(iface);
+    // Validate inputs
+    std::string safe_iface = SEC.safe_interface(iface);
+    if (safe_iface.empty()) {
+        SEC.log_attempt("apply_mac", "invalid interface: " + iface, false);
+        return false;
+    }
     
-    std::string old_mac = get_current_mac(iface);
+    std::string safe_mac = SEC.safe_mac(new_mac);
+    if (safe_mac.empty()) {
+        SEC.log_attempt("apply_mac", "invalid MAC: " + new_mac, false);
+        return false;
+    }
+    
+    // Store original first
+    store_original_mac(safe_iface);
+    
+    std::string old_mac = get_current_mac(safe_iface);
     
     // Bring interface down
-    auto r1 = exec::run_root("ip link set " + iface + " down");
-    if (r1.code != 0) return false;
+    auto r1 = SEC.exec("ip link set " + safe_iface + " down", true);
+    if (r1.code != 0) {
+        SEC.log_attempt("apply_mac", "failed to bring down " + safe_iface, false);
+        return false;
+    }
     
     // Set new MAC
-    auto r2 = exec::run_root("ip link set " + iface + " address " + new_mac);
+    auto r2 = SEC.exec("ip link set " + safe_iface + " address " + safe_mac, true);
     if (r2.code != 0) {
         // Try to bring back up even if failed
-        exec::run_root("ip link set " + iface + " up");
+        SEC.exec("ip link set " + safe_iface + " up", true);
+        SEC.log_attempt("apply_mac", "failed to set MAC on " + safe_iface, false);
         return false;
     }
     
     // Bring interface up
-    auto r3 = exec::run_root("ip link set " + iface + " up");
+    auto r3 = SEC.exec("ip link set " + safe_iface + " up", true);
     
     // Add to history
     SpoofEvent event;
@@ -155,29 +192,49 @@ bool apply_mac(const std::string& iface, const std::string& new_mac) {
     char buf[32];
     std::strftime(buf, sizeof(buf), "%H:%M:%S", std::localtime(&time));
     event.timestamp = buf;
-    event.interface = iface;
+    event.interface = safe_iface;
     event.old_mac = old_mac;
-    event.new_mac = new_mac;
-    event.ssid = get_ssid(iface);
+    event.new_mac = safe_mac;
+    event.ssid = get_ssid(safe_iface);
     add_history(event);
     
+    SEC.log_attempt("apply_mac", safe_iface + " -> " + safe_mac, true);
     return r3.code == 0;
 }
 
 bool restore_original(const std::string& iface) {
-    std::string original = get_original_mac(iface);
+    std::string safe_iface = SEC.safe_interface(iface);
+    if (safe_iface.empty()) return false;
+    
+    std::string original = get_original_mac(safe_iface);
     if (original.empty()) return false;
     
-    return apply_mac(iface, original);
+    return apply_mac(safe_iface, original);
 }
 
 std::string get_ssid(const std::string& iface) {
-    std::string output = exec::run("iwgetid " + iface + " -r 2>/dev/null");
+    std::string safe_iface = SEC.safe_interface(iface);
+    if (safe_iface.empty()) return "Not Connected";
+    
+    auto result = SEC.exec_timeout("iwgetid " + safe_iface + " -r", 3, false);
+    std::string output = result.out;
+    
     // Trim newline
-    if (!output.empty() && output.back() == '\n') {
+    while (!output.empty() && (output.back() == '\n' || output.back() == '\r')) {
         output.pop_back();
     }
-    return output.empty() ? "Not Connected" : output;
+    
+    if (output.empty()) return "Not Connected";
+    
+    // Sanitize SSID output (could contain anything)
+    std::string sanitized;
+    for (char c : output) {
+        if (c >= 32 && c < 127) {
+            sanitized += c;
+        }
+    }
+    
+    return sanitized.empty() ? "Not Connected" : sanitized;
 }
 
 bool is_wifi_connected(const std::string& iface) {
@@ -186,21 +243,25 @@ bool is_wifi_connected(const std::string& iface) {
 }
 
 bool has_internet() {
-    // Quick connectivity check
-    auto result = exec::run("curl -s --connect-timeout 3 --max-time 5 http://captive.apple.com/hotspot-detect.html 2>/dev/null");
-    return result.find("Success") != std::string::npos;
+    // Quick connectivity check - no user input, safe command
+    auto result = SEC.exec_timeout(
+        "curl -s --connect-timeout 3 --max-time 5 http://captive.apple.com/hotspot-detect.html",
+        10, false);
+    return result.out.find("Success") != std::string::npos;
 }
 
 bool is_captive_portal() {
-    auto result = exec::run("curl -s --connect-timeout 3 --max-time 5 http://captive.apple.com/hotspot-detect.html 2>/dev/null");
+    auto result = SEC.exec_timeout(
+        "curl -s --connect-timeout 3 --max-time 5 http://captive.apple.com/hotspot-detect.html",
+        10, false);
     
-    if (result.find("Success") != std::string::npos) {
+    if (result.out.find("Success") != std::string::npos) {
         return false;  // Normal internet
     }
-    if (result.find("<html") != std::string::npos ||
-        result.find("paused") != std::string::npos ||
-        result.find("xfinity") != std::string::npos ||
-        result.find("captive") != std::string::npos) {
+    if (result.out.find("<html") != std::string::npos ||
+        result.out.find("paused") != std::string::npos ||
+        result.out.find("xfinity") != std::string::npos ||
+        result.out.find("captive") != std::string::npos) {
         return true;  // Captive portal detected
     }
     return false;
@@ -209,37 +270,54 @@ bool is_captive_portal() {
 void start_monitor(const std::string& iface, int interval_sec,
                    bool lock_to_network, const std::string& target_ssid,
                    bool notifications, SpoofCallback callback) {
-    if (monitoring) {
+    // Validate interface upfront
+    std::string safe_iface = SEC.safe_interface(iface);
+    if (safe_iface.empty()) return;
+    
+    // Sanitize SSID if provided
+    std::string safe_target_ssid;
+    if (lock_to_network && !target_ssid.empty()) {
+        auto ssid_result = SEC.validate(security::InputType::SSID, target_ssid);
+        if (ssid_result.valid) {
+            safe_target_ssid = ssid_result.sanitized;
+        }
+    }
+    
+    // Clamp interval
+    if (interval_sec < 5) interval_sec = 5;
+    if (interval_sec > 3600) interval_sec = 3600;
+    
+    if (s_monitoring) {
         stop_monitor();
     }
     
-    monitoring = true;
+    s_monitoring = true;
     
-    monitor_thread = std::thread([=]() {
-        bool last_connected = is_wifi_connected(iface);
-        std::string last_ssid = get_ssid(iface);
+    s_monitor_thread = std::thread([=]() {
+        bool last_connected = is_wifi_connected(safe_iface);
+        std::string last_ssid = get_ssid(safe_iface);
         
-        while (monitoring) {
+        while (s_monitoring) {
             std::this_thread::sleep_for(std::chrono::seconds(interval_sec));
             
-            if (!monitoring) break;
+            if (!s_monitoring) break;
             
-            bool connected = is_wifi_connected(iface);
-            std::string current_ssid = get_ssid(iface);
+            bool connected = is_wifi_connected(safe_iface);
+            std::string current_ssid = get_ssid(safe_iface);
             
             // Reconnection detected
             if (connected && !last_connected) {
                 // Check if we should spoof
                 bool should_spoof = true;
-                if (lock_to_network && current_ssid != target_ssid) {
+                if (lock_to_network && current_ssid != safe_target_ssid) {
                     should_spoof = false;
                 }
                 
                 if (should_spoof) {
                     std::string new_mac = generate_random_mac();
-                    if (apply_mac(iface, new_mac) && callback) {
+                    if (apply_mac(safe_iface, new_mac) && callback) {
                         SpoofEvent event;
-                        event.interface = iface;
+                        event.interface = safe_iface;
                         event.new_mac = new_mac;
                         event.ssid = current_ssid;
                         callback(event);
@@ -254,30 +332,33 @@ void start_monitor(const std::string& iface, int interval_sec,
 }
 
 void stop_monitor() {
-    monitoring = false;
-    if (monitor_thread.joinable()) {
-        monitor_thread.join();
+    s_monitoring = false;
+    if (s_monitor_thread.joinable()) {
+        s_monitor_thread.join();
     }
 }
 
 bool is_monitoring() {
-    return monitoring;
+    return s_monitoring;
 }
 
 std::vector<SpoofEvent> get_history() {
-    return history;
+    std::lock_guard<std::mutex> lock(s_state_mutex);
+    return s_history;
 }
 
 void add_history(const SpoofEvent& event) {
-    history.insert(history.begin(), event);
+    std::lock_guard<std::mutex> lock(s_state_mutex);
+    s_history.insert(s_history.begin(), event);
     // Keep only last 50
-    if (history.size() > 50) {
-        history.resize(50);
+    if (s_history.size() > 50) {
+        s_history.resize(50);
     }
 }
 
 void clear_history() {
-    history.clear();
+    std::lock_guard<std::mutex> lock(s_state_mutex);
+    s_history.clear();
 }
 
 } // namespace mac_spoofer

@@ -12,6 +12,7 @@ BIN = netman
 SRCS = $(SRC_DIR)/main.cpp \
        $(SRC_DIR)/app.cpp \
        $(SRC_DIR)/core/state.cpp \
+       $(SRC_DIR)/core/security_manager.cpp \
        $(SRC_DIR)/helpers/exec.cpp \
        $(SRC_DIR)/net/interfaces.cpp \
        $(SRC_DIR)/net/scanner.cpp \
