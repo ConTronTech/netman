@@ -20,10 +20,21 @@ static void ensure_dir() {
     std::filesystem::create_directories(NETMAN_DIR);
 }
 
-// Debug log
+// Debug log with rotation (max 1MB)
 static std::ofstream s_log;
 static void log(const std::string& msg) {
     ensure_dir();
+    
+    // Rotate log if too big (>1MB)
+    if (std::filesystem::exists(HOTSPOT_LOG)) {
+        auto size = std::filesystem::file_size(HOTSPOT_LOG);
+        if (size > 1024 * 1024) {
+            s_log.close();
+            std::filesystem::remove(HOTSPOT_LOG + ".old");
+            std::filesystem::rename(HOTSPOT_LOG, HOTSPOT_LOG + ".old");
+        }
+    }
+    
     if (!s_log.is_open()) {
         s_log.open(HOTSPOT_LOG, std::ios::app);
     }
@@ -88,6 +99,18 @@ static int safe_stoi(const std::string& s, int def = 0) {
         return def;
     }
 }
+
+// Validate country code (2 uppercase letters)
+static bool is_valid_country(const std::string& cc) {
+    if (cc.length() != 2) return false;
+    return std::isupper(cc[0]) && std::isupper(cc[1]);
+}
+
+// Valid country codes
+static const std::vector<std::string> VALID_COUNTRIES = {
+    "US", "CA", "GB", "DE", "FR", "AU", "JP", "CN", "FI", "NL",
+    "ES", "IT", "BR", "MX", "IN", "KR", "TW", "SG", "HK", "NZ"
+};
 
 std::vector<std::string> get_ap_capable_interfaces() {
     std::vector<std::string> result;
@@ -203,38 +226,48 @@ bool start(const Config& cfg) {
         log("ERROR: " + s_last_error);
         return false;
     }
+    if (!is_valid_country(cfg.country_code)) {
+        s_last_error = "Invalid country code";
+        log("ERROR: " + s_last_error);
+        return false;
+    }
+    
+    // Sanitize inputs for shell safety
+    std::string safe_iface = shell_escape(cfg.interface);
+    std::string safe_ssid = cfg.ssid;  // SSID can have special chars, handled in config file
+    std::string safe_share = shell_escape(cfg.share_from);
     
     // === CRITICAL: Release interface from other managers ===
     log("Releasing interface from NetworkManager...");
     
     // Stop NetworkManager from managing this interface
-    auto nm_result = exec::run("nmcli device set " + cfg.interface + " managed no 2>&1");
+    auto nm_result = exec::run("nmcli device set " + safe_iface + " managed no 2>&1");
     log("nmcli result: " + nm_result);
     
     // Kill wpa_supplicant ONLY for this interface (not all!)
-    exec::run("pkill -f 'wpa_supplicant.*-i" + cfg.interface + "' 2>/dev/null");
-    exec::run("pkill -f 'wpa_supplicant.*" + cfg.interface + "' 2>/dev/null");
+    exec::run("pkill -f 'wpa_supplicant.*-i" + safe_iface + "' 2>/dev/null");
+    exec::run("pkill -f 'wpa_supplicant.*" + safe_iface + "' 2>/dev/null");
     
     // Small delay for processes to die
     exec::run("sleep 0.5");
     
     // Bring down interface
     log("Bringing down interface...");
-    exec::run("ip link set " + cfg.interface + " down");
-    exec::run("ip addr flush dev " + cfg.interface);
+    exec::run("ip link set " + safe_iface + " down");
+    exec::run("ip addr flush dev " + safe_iface);
     
     // Set interface type
-    exec::run("iw dev " + cfg.interface + " set type managed 2>/dev/null");
+    exec::run("iw dev " + safe_iface + " set type managed 2>/dev/null");
     
     // Set static IP for AP
-    log("Setting IP 192.168.50.1...");
-    auto ip_result = exec::run("ip addr add 192.168.50.1/24 dev " + cfg.interface + " 2>&1");
+    log("Setting IP " + cfg.ap_ip + "...");
+    auto ip_result = exec::run("ip addr add " + cfg.ap_ip + "/24 dev " + safe_iface + " 2>&1");
     log("ip addr result: " + ip_result);
     
-    exec::run("ip link set " + cfg.interface + " up");
+    exec::run("ip link set " + safe_iface + " up");
     
     // Verify interface is up
-    auto link_state = exec::run("ip link show " + cfg.interface + " 2>&1");
+    auto link_state = exec::run("ip link show " + safe_iface + " 2>&1");
     log("Link state: " + link_state);
     
     // Set regulatory domain (required for 5GHz AP mode)
@@ -278,8 +311,8 @@ bool start(const Config& cfg) {
     std::ofstream dconf(DNSMASQ_CONF);
     dconf << "interface=" << cfg.interface << "\n";
     dconf << "bind-interfaces\n";
-    dconf << "dhcp-range=192.168.50.10,192.168.50.254,24h\n";
-    dconf << "dhcp-option=option:router,192.168.50.1\n";
+    dconf << "dhcp-range=" << cfg.dhcp_start << "," << cfg.dhcp_end << ",24h\n";
+    dconf << "dhcp-option=option:router," << cfg.ap_ip << "\n";
     dconf << "dhcp-option=option:dns-server,8.8.8.8,8.8.4.4\n";
     dconf << "dhcp-leasefile=" << DNSMASQ_LEASES << "\n";
     dconf.close();
@@ -314,9 +347,9 @@ bool start(const Config& cfg) {
     log("dnsmasq output: " + dnsmasq_result);
     
     // Enable NAT if sharing internet
-    if (!cfg.share_from.empty()) {
-        log("Enabling NAT from " + cfg.share_from);
-        enable_nat(cfg.interface, cfg.share_from);
+    if (!safe_share.empty()) {
+        log("Enabling NAT from " + safe_share);
+        enable_nat(safe_iface, safe_share);
     }
     
     s_current_config = cfg;

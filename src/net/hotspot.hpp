@@ -25,6 +25,9 @@ struct Config {
     std::string band = "2.4";   // "2.4" or "5"
     std::string share_from;     // Interface to share internet from (NAT)
     std::string country_code = "US";  // Regulatory domain (required for 5GHz)
+    std::string ap_ip = "192.168.50.1";  // AP IP address
+    std::string dhcp_start = "192.168.50.10";  // DHCP range start
+    std::string dhcp_end = "192.168.50.254";   // DHCP range end
     bool hidden = false;
 };
 
