@@ -306,12 +306,26 @@ bool start(const Config& cfg) {
         return false;
     }
     
-    // Sanitize inputs for shell safety
-    std::string safe_iface = shell_escape(cfg.interface);
-    std::string safe_ssid = config_escape(cfg.ssid);  // For config file
-    std::string safe_pass = config_escape(cfg.password);  // For config file
-    std::string safe_share = shell_escape(cfg.share_from);
-    std::string safe_ap_ip = cfg.ap_ip;  // Already validated
+    // Sanitize inputs - use SEC validators and keep sanitized results
+    std::string safe_iface = SEC.safe_interface(cfg.interface);
+    std::string safe_ssid = SEC.safe_ssid(cfg.ssid);
+    std::string safe_pass = SEC.safe_password(cfg.password);
+    std::string safe_share = cfg.share_from.empty() ? "" : SEC.safe_interface(cfg.share_from);
+    
+    // Get sanitized versions (normalized)
+    auto ap_ip_result = SEC.validate(security::InputType::IP_ADDRESS, cfg.ap_ip);
+    auto dhcp_start_result = SEC.validate(security::InputType::IP_ADDRESS, cfg.dhcp_start);
+    auto dhcp_end_result = SEC.validate(security::InputType::IP_ADDRESS, cfg.dhcp_end);
+    auto country_result = SEC.validate(security::InputType::COUNTRY_CODE, cfg.country_code);
+    
+    std::string safe_ap_ip = ap_ip_result.sanitized;
+    std::string safe_dhcp_start = dhcp_start_result.sanitized;
+    std::string safe_dhcp_end = dhcp_end_result.sanitized;
+    std::string safe_country = country_result.sanitized;
+    
+    // Band and channel (already validated above, use directly)
+    std::string safe_band = cfg.band;  // "2.4" or "5" only
+    int safe_channel = cfg.channel;    // Validated channel number
     
     // Verify sanitization didn't empty critical values
     if (safe_iface.empty() || safe_ssid.empty()) {
@@ -348,8 +362,8 @@ bool start(const Config& cfg) {
     SEC.exec("iw dev " + safe_iface + " set type managed 2>/dev/null", false).out;
     
     // Set static IP for AP
-    log("Setting IP " + cfg.ap_ip + "...");
-    auto ip_result = SEC.exec("ip addr add " + cfg.ap_ip + "/24 dev " + safe_iface + " 2>&1", false).out;
+    log("Setting IP " + safe_ap_ip + "...");
+    auto ip_result = SEC.exec("ip addr add " + safe_ap_ip + "/24 dev " + safe_iface + " 2>&1", false).out;
     log("ip addr result: " + ip_result);
     
     SEC.exec("ip link set " + safe_iface + " up", false).out;
@@ -359,8 +373,8 @@ bool start(const Config& cfg) {
     log("Link state: " + link_state);
     
     // Set regulatory domain (required for 5GHz AP mode)
-    log("Setting regulatory domain to " + cfg.country_code);
-    SEC.exec("iw reg set " + cfg.country_code + " 2>&1", false).out;
+    log("Setting regulatory domain to " + safe_country);
+    SEC.exec("iw reg set " + safe_country + " 2>&1", false).out;
     SEC.exec("sleep 0.3", false).out;
     
     // Generate hostapd config
@@ -375,12 +389,12 @@ bool start(const Config& cfg) {
     hconf << "interface=" << safe_iface << "\n";
     hconf << "driver=nl80211\n";
     hconf << "ssid=" << safe_ssid << "\n";
-    hconf << "country_code=" << cfg.country_code << "\n";
+    hconf << "country_code=" << safe_country << "\n";
     hconf << "ieee80211d=1\n";  // Advertise country code
-    hconf << "hw_mode=" << (cfg.band == "5" ? "a" : "g") << "\n";
-    hconf << "channel=" << cfg.channel << "\n";
+    hconf << "hw_mode=" << (safe_band == "5" ? "a" : "g") << "\n";
+    hconf << "channel=" << safe_channel << "\n";
     hconf << "ieee80211n=1\n";
-    if (cfg.band == "5") {
+    if (safe_band == "5") {
         hconf << "ieee80211ac=1\n";
     }
     hconf << "wmm_enabled=1\n";
@@ -419,8 +433,8 @@ bool start(const Config& cfg) {
     }
     dconf << "interface=" << safe_iface << "\n";
     dconf << "bind-interfaces\n";
-    dconf << "dhcp-range=" << cfg.dhcp_start << "," << cfg.dhcp_end << ",24h\n";
-    dconf << "dhcp-option=option:router," << cfg.ap_ip << "\n";
+    dconf << "dhcp-range=" << safe_dhcp_start << "," << safe_dhcp_end << ",24h\n";
+    dconf << "dhcp-option=option:router," << safe_ap_ip << "\n";
     dconf << "dhcp-option=option:dns-server,8.8.8.8,8.8.4.4\n";
     dconf << "dhcp-leasefile=" << DNSMASQ_LEASES << "\n";
     dconf.close();
