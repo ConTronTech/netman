@@ -404,7 +404,11 @@ std::vector<Client> get_clients() {
     if (!is_running()) return result;
     
     // Get currently connected stations from iw
-    auto station_dump = exec::run("iw dev " + s_current_config.interface + " station dump 2>/dev/null");
+    std::string iface = s_current_config.interface;
+    log("get_clients: interface = " + iface);
+    
+    auto station_dump = exec::run("iw dev " + iface + " station dump 2>&1");
+    log("station dump output:\n" + station_dump);
     
     // Parse station dump
     std::istringstream ss(station_dump);
@@ -456,6 +460,11 @@ std::vector<Client> get_clients() {
     if (in_station && !current.mac.empty()) {
         current.connected = true;
         result.push_back(current);
+    }
+    
+    log("Found " + std::to_string(result.size()) + " connected stations");
+    for (const auto& c : result) {
+        log("  Station: " + c.mac + " signal=" + std::to_string(c.signal));
     }
     
     // Cross-reference with dnsmasq leases for IP/hostname
