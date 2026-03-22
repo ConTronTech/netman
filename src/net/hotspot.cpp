@@ -403,22 +403,30 @@ std::vector<Client> get_clients() {
     
     if (!is_running()) return result;
     
-    // Get currently connected stations from iw
     std::string iface = s_current_config.interface;
     log("get_clients: interface = " + iface);
     
-    auto station_dump = exec::run("iw dev " + iface + " station dump 2>&1");
+    // Try iw first (full path), then hostapd_cli as fallback
+    auto station_dump = exec::run("/usr/sbin/iw dev " + iface + " station dump 2>&1");
+    
+    // If iw not found, try hostapd_cli
+    if (station_dump.find("not found") != std::string::npos || 
+        station_dump.find("No such file") != std::string::npos) {
+        log("iw not found, trying hostapd_cli");
+        station_dump = exec::run("hostapd_cli -i " + iface + " all_sta 2>&1");
+    }
+    
     log("station dump output:\n" + station_dump);
     
-    // Parse station dump
+    // Parse station dump (handles both iw and hostapd_cli formats)
     std::istringstream ss(station_dump);
     std::string line;
     Client current;
     bool in_station = false;
     
     while (std::getline(ss, line)) {
+        // iw format: "Station aa:bb:cc:dd:ee:ff (on wlan0)"
         if (line.find("Station ") == 0) {
-            // New station entry
             if (in_station && !current.mac.empty()) {
                 current.connected = true;
                 result.push_back(current);
@@ -426,31 +434,58 @@ std::vector<Client> get_clients() {
             current = Client{};
             in_station = true;
             
-            // Extract MAC: "Station aa:bb:cc:dd:ee:ff (on wlan0)"
-            size_t start = 8;  // After "Station "
+            size_t start = 8;
             size_t end = line.find(" ", start);
             if (end != std::string::npos) {
                 current.mac = line.substr(start, end - start);
             }
-        } else if (in_station) {
-            // Parse station info
-            if (line.find("signal:") != std::string::npos) {
-                // "signal: -45 dBm"
-                size_t pos = line.find(":");
+        }
+        // hostapd_cli format: MAC address on its own line (aa:bb:cc:dd:ee:ff)
+        else if (line.length() == 17 && line[2] == ':' && line[5] == ':') {
+            if (in_station && !current.mac.empty()) {
+                current.connected = true;
+                result.push_back(current);
+            }
+            current = Client{};
+            current.mac = line;
+            in_station = true;
+        }
+        else if (in_station) {
+            // Parse station info (works for both formats)
+            // iw: "	signal:  -45 dBm" or "	signal avg:	-45 dBm"
+            // hostapd_cli: "signal=-45"
+            if (line.find("signal") != std::string::npos && line.find("avg") == std::string::npos) {
+                size_t pos = line.find("=");
+                if (pos == std::string::npos) pos = line.find(":");
                 if (pos != std::string::npos) {
-                    std::string val = line.substr(pos + 1);
-                    current.signal = std::stoi(val);
-                    current.signal_percent = dbm_to_percent(current.signal);
+                    try {
+                        std::string val = line.substr(pos + 1);
+                        // Remove leading whitespace and trailing text
+                        size_t start = val.find_first_not_of(" \t");
+                        if (start != std::string::npos) {
+                            val = val.substr(start);
+                        }
+                        current.signal = std::stoi(val);
+                        current.signal_percent = dbm_to_percent(current.signal);
+                    } catch (...) {}
                 }
-            } else if (line.find("rx bytes:") != std::string::npos) {
+            }
+            else if (line.find("rx bytes") != std::string::npos) {
                 size_t pos = line.find(":");
+                if (pos == std::string::npos) pos = line.find("=");
                 if (pos != std::string::npos) {
-                    current.rx_bytes = std::stoull(line.substr(pos + 1));
+                    try {
+                        current.rx_bytes = std::stoull(line.substr(pos + 1));
+                    } catch (...) {}
                 }
-            } else if (line.find("tx bytes:") != std::string::npos) {
+            }
+            else if (line.find("tx bytes") != std::string::npos) {
                 size_t pos = line.find(":");
+                if (pos == std::string::npos) pos = line.find("=");
                 if (pos != std::string::npos) {
-                    current.tx_bytes = std::stoull(line.substr(pos + 1));
+                    try {
+                        current.tx_bytes = std::stoull(line.substr(pos + 1));
+                    } catch (...) {}
                 }
             }
         }

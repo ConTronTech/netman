@@ -90,7 +90,7 @@ A lightweight Linux network manager GUI that simplifies complex networking tasks
 sudo apt install build-essential libgtkmm-4.0-dev libvte-2.91-gtk4-dev
 
 # For hotspot functionality
-sudo apt install hostapd dnsmasq
+sudo apt install hostapd dnsmasq iw
 
 # For device scanning
 sudo apt install arp-scan
