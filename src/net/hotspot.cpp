@@ -406,14 +406,15 @@ std::vector<Client> get_clients() {
     std::string iface = s_current_config.interface;
     log("get_clients: interface = " + iface);
     
-    // Try iw first (full path), then hostapd_cli as fallback
-    auto station_dump = exec::run("/usr/sbin/iw dev " + iface + " station dump 2>&1");
+    // Try hostapd_cli first (comes with hostapd), then iw as fallback
+    auto station_dump = exec::run("hostapd_cli -i " + iface + " all_sta 2>&1");
     
-    // If iw not found, try hostapd_cli
+    // If hostapd_cli fails, try iw
     if (station_dump.find("not found") != std::string::npos || 
+        station_dump.find("Failed to connect") != std::string::npos ||
         station_dump.find("No such file") != std::string::npos) {
-        log("iw not found, trying hostapd_cli");
-        station_dump = exec::run("hostapd_cli -i " + iface + " all_sta 2>&1");
+        log("hostapd_cli failed, trying iw");
+        station_dump = exec::run("/usr/sbin/iw dev " + iface + " station dump 2>&1");
     }
     
     log("station dump output:\n" + station_dump);
