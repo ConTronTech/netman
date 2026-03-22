@@ -407,14 +407,17 @@ std::vector<Client> get_clients() {
     log("get_clients: interface = " + iface);
     
     // Try hostapd_cli first (comes with hostapd), then iw as fallback
-    auto station_dump = exec::run("hostapd_cli -i " + iface + " all_sta 2>&1");
+    // Use timeout to prevent blocking
+    auto station_dump = exec::run("timeout 2 hostapd_cli -i " + iface + " all_sta 2>&1");
     
     // If hostapd_cli fails, try iw
-    if (station_dump.find("not found") != std::string::npos || 
+    if (station_dump.empty() ||
+        station_dump.find("not found") != std::string::npos || 
         station_dump.find("Failed to connect") != std::string::npos ||
-        station_dump.find("No such file") != std::string::npos) {
+        station_dump.find("No such file") != std::string::npos ||
+        station_dump.find("timed out") != std::string::npos) {
         log("hostapd_cli failed, trying iw");
-        station_dump = exec::run("/usr/sbin/iw dev " + iface + " station dump 2>&1");
+        station_dump = exec::run("timeout 2 /usr/sbin/iw dev " + iface + " station dump 2>&1");
     }
     
     log("station dump output:\n" + station_dump);
