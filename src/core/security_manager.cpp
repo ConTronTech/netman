@@ -46,6 +46,63 @@ static const std::vector<int> VALID_5GHZ_CHANNELS = {
     116, 120, 124, 128, 132, 136, 140, 144, 149, 153, 157, 161, 165
 };
 
+// Allowed root command prefixes - ONLY these can run with needs_root=true
+static const std::vector<std::string> ROOT_COMMAND_WHITELIST = {
+    // Network interface management
+    "ip link ",
+    "ip addr ",
+    "ip route ",
+    "ip neigh ",
+    // WiFi tools
+    "iw ",
+    "iwconfig ",
+    "iwlist ",
+    "iwgetid ",
+    "hostapd",
+    "wpa_supplicant",
+    // DHCP/DNS
+    "dnsmasq",
+    // Firewall
+    "iptables ",
+    "iptables-save",
+    "iptables-restore",
+    // Network manager
+    "nmcli ",
+    "systemctl restart wpa_supplicant",
+    "systemctl restart NetworkManager",
+    // Process management (scoped)
+    "pkill -f 'hostapd",
+    "pkill -f 'dnsmasq",
+    "pkill -f 'wpa_supplicant",
+    // Scanning
+    "arp-scan ",
+    // Utilities
+    "timeout ",
+    "cat /tmp/netman/",
+    "sleep ",
+    "echo 1 > /proc/sys/net/ipv4/ip_forward",
+    "echo 0 > /proc/sys/net/ipv4/ip_forward",
+    // Regulatory
+    "iw reg set ",
+};
+
+// Allowed log path prefixes
+static const std::vector<std::string> ALLOWED_LOG_PATHS = {
+    "/tmp/netman/",
+    "/var/log/netman/"
+};
+
+// Sensitive patterns to redact in logs
+static const std::vector<std::string> SENSITIVE_PATTERNS = {
+    "passphrase",
+    "password",
+    "wpa_passphrase",
+    "psk=",
+    "key=",
+    "secret",
+    "token",
+};
+
 // =============================================================================
 // IMPLEMENTATION
 // =============================================================================
@@ -608,8 +665,39 @@ bool SecurityManager::can_elevate() {
 // SECURE EXECUTION
 // =============================================================================
 
+// Check if command matches whitelist
+static bool is_command_allowed(const std::string& cmd, bool needs_root) {
+    // Non-root commands: allow common safe commands
+    if (!needs_root) {
+        // Allow read-only / info commands without root
+        static const std::vector<std::string> SAFE_USER_COMMANDS = {
+            "which ", "cat ", "ls ", "ip ", "iw ", "iwconfig ", "iwlist ",
+            "iwgetid ", "ping ", "curl ", "getent ", "sleep ", "timeout ",
+        };
+        for (const auto& prefix : SAFE_USER_COMMANDS) {
+            if (cmd.find(prefix) == 0) return true;
+        }
+        // Also allow anything in root whitelist for non-root (will fail if needs elevation)
+    }
+    
+    // Check root whitelist
+    for (const auto& prefix : ROOT_COMMAND_WHITELIST) {
+        if (cmd.find(prefix) == 0) return true;
+    }
+    
+    return false;
+}
+
 SecurityManager::ExecResult SecurityManager::exec(const std::string& cmd, bool needs_root) {
     ExecResult result;
+    
+    // SECURITY: Validate command against whitelist
+    if (!is_command_allowed(cmd, needs_root)) {
+        result.code = -1;
+        result.err = "Command not in whitelist";
+        m_impl->log("[EXEC BLOCKED] " + cmd.substr(0, 100) + " (not whitelisted)");
+        return result;
+    }
     
     // Log execution
     log_exec(cmd, needs_root, -1);
@@ -646,6 +734,10 @@ SecurityManager::ExecResult SecurityManager::exec(const std::string& cmd, bool n
 }
 
 SecurityManager::ExecResult SecurityManager::exec_timeout(const std::string& cmd, int timeout_sec, bool needs_root) {
+    // Validate timeout range (1 second to 5 minutes)
+    if (timeout_sec < 1) timeout_sec = 1;
+    if (timeout_sec > 300) timeout_sec = 300;
+    
     std::string timeout_cmd = "timeout " + std::to_string(timeout_sec) + " " + cmd;
     return exec(timeout_cmd, needs_root);
 }
@@ -658,9 +750,18 @@ void SecurityManager::log_attempt(const std::string& action, const std::string& 
     std::string status = allowed ? "[ALLOWED]" : "[BLOCKED]";
     std::string sanitized_input = input;
     
-    // Don't log passwords
-    if (action.find("password") != std::string::npos) {
-        sanitized_input = "[REDACTED]";
+    // Check for sensitive patterns in action or input
+    std::string action_lower = action;
+    std::string input_lower = input;
+    std::transform(action_lower.begin(), action_lower.end(), action_lower.begin(), ::tolower);
+    std::transform(input_lower.begin(), input_lower.end(), input_lower.begin(), ::tolower);
+    
+    for (const auto& pattern : SENSITIVE_PATTERNS) {
+        if (action_lower.find(pattern) != std::string::npos ||
+            input_lower.find(pattern) != std::string::npos) {
+            sanitized_input = "[REDACTED]";
+            break;
+        }
     }
     
     // Truncate long inputs
@@ -675,11 +776,16 @@ void SecurityManager::log_exec(const std::string& cmd, bool needs_root, int resu
     std::string prefix = needs_root ? "[ROOT] " : "[USER] ";
     std::string status = result_code == -1 ? "STARTED" : ("EXIT=" + std::to_string(result_code));
     
-    // Redact sensitive commands
+    // Check for ANY sensitive pattern
     std::string safe_cmd = cmd;
-    if (safe_cmd.find("wpa_passphrase") != std::string::npos ||
-        safe_cmd.find("passphrase") != std::string::npos) {
-        safe_cmd = "[COMMAND WITH PASSWORD REDACTED]";
+    std::string cmd_lower = cmd;
+    std::transform(cmd_lower.begin(), cmd_lower.end(), cmd_lower.begin(), ::tolower);
+    
+    for (const auto& pattern : SENSITIVE_PATTERNS) {
+        if (cmd_lower.find(pattern) != std::string::npos) {
+            safe_cmd = "[COMMAND REDACTED - CONTAINS SENSITIVE DATA]";
+            break;
+        }
     }
     
     // Truncate long commands
@@ -709,9 +815,27 @@ std::vector<std::string> SecurityManager::get_security_log(int max_entries) {
 
 void SecurityManager::set_log_path(const std::string& path) {
     auto r = validate_path(path);
-    if (r.valid) {
-        m_impl->log_path = r.sanitized;
+    if (!r.valid) {
+        m_impl->log("[CONFIG BLOCKED] Invalid log path: " + path);
+        return;
     }
+    
+    // Enforce allowed prefixes
+    bool allowed = false;
+    for (const auto& prefix : ALLOWED_LOG_PATHS) {
+        if (r.sanitized.find(prefix) == 0) {
+            allowed = true;
+            break;
+        }
+    }
+    
+    if (!allowed) {
+        m_impl->log("[CONFIG BLOCKED] Log path not in allowed directories: " + path);
+        return;
+    }
+    
+    m_impl->log_path = r.sanitized;
+    m_impl->log("[CONFIG] Log path set to: " + r.sanitized);
 }
 
 void SecurityManager::set_strict_mode(bool strict) {
