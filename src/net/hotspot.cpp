@@ -8,12 +8,14 @@
 #include <algorithm>
 #include <cctype>
 #include <map>
+#include <mutex>
 
 namespace hotspot {
 
 static Config s_current_config;
 static bool s_running = false;
 static std::string s_last_error;
+static std::mutex s_state_mutex;  // Protects s_current_config, s_running, s_last_error
 
 // Ensure netman directory exists
 static void ensure_dir() {
@@ -22,21 +24,28 @@ static void ensure_dir() {
 
 // Debug log with rotation (max 1MB)
 static std::ofstream s_log;
+static std::mutex s_log_mutex;
 static void log(const std::string& msg) {
+    std::lock_guard<std::mutex> lock(s_log_mutex);
     ensure_dir();
     
     // Rotate log if too big (>1MB)
     if (std::filesystem::exists(HOTSPOT_LOG)) {
-        auto size = std::filesystem::file_size(HOTSPOT_LOG);
-        if (size > 1024 * 1024) {
-            s_log.close();
-            std::filesystem::remove(HOTSPOT_LOG + ".old");
-            std::filesystem::rename(HOTSPOT_LOG, HOTSPOT_LOG + ".old");
-        }
+        try {
+            auto size = std::filesystem::file_size(HOTSPOT_LOG);
+            if (size > 1024 * 1024) {
+                s_log.close();
+                std::filesystem::remove(HOTSPOT_LOG + ".old");
+                std::filesystem::rename(HOTSPOT_LOG, HOTSPOT_LOG + ".old");
+            }
+        } catch (...) {}
     }
     
     if (!s_log.is_open()) {
         s_log.open(HOTSPOT_LOG, std::ios::app);
+        // Set restrictive permissions on log file
+        std::filesystem::permissions(HOTSPOT_LOG,
+            std::filesystem::perms::owner_read | std::filesystem::perms::owner_write);
     }
     s_log << "[" << time(nullptr) << "] " << msg << std::endl;
     s_log.flush();
@@ -159,6 +168,34 @@ static std::string config_escape(const std::string& s) {
     }
     return result;
 }
+
+// Validate MAC address format
+static bool is_valid_mac(const std::string& mac) {
+    if (mac.length() != 17) return false;
+    for (int i = 0; i < 17; i++) {
+        if (i % 3 == 2) {
+            if (mac[i] != ':') return false;
+        } else {
+            if (!std::isxdigit(mac[i])) return false;
+        }
+    }
+    return true;
+}
+
+// Validate hostname (alphanumeric + hyphen, max 63 chars)
+static std::string sanitize_hostname(const std::string& h) {
+    std::string result;
+    for (char c : h) {
+        if (std::isalnum(c) || c == '-' || c == '.') {
+            result += c;
+        }
+        if (result.length() >= 63) break;
+    }
+    return result;
+}
+
+// Thread-safe mutex for static state
+static std::mutex s_mutex;
 
 std::vector<std::string> get_ap_capable_interfaces() {
     std::vector<std::string> result;
@@ -290,8 +327,18 @@ bool start(const Config& cfg) {
         log("ERROR: " + s_last_error);
         return false;
     }
+    if (cfg.ssid.length() > 32) {
+        s_last_error = "SSID too long (max 32 chars)";
+        log("ERROR: " + s_last_error);
+        return false;
+    }
     if (cfg.password.length() < 8 && !cfg.password.empty()) {
         s_last_error = "Password must be 8+ chars";
+        log("ERROR: " + s_last_error);
+        return false;
+    }
+    if (cfg.password.length() > 63) {
+        s_last_error = "Password too long (max 63 chars)";
         log("ERROR: " + s_last_error);
         return false;
     }
@@ -322,6 +369,18 @@ bool start(const Config& cfg) {
     std::string safe_pass = config_escape(cfg.password);  // For config file
     std::string safe_share = shell_escape(cfg.share_from);
     std::string safe_ap_ip = cfg.ap_ip;  // Already validated
+    
+    // Verify sanitization didn't empty critical values
+    if (safe_iface.empty() || safe_ssid.empty()) {
+        s_last_error = "Interface or SSID contains only invalid characters";
+        log("ERROR: " + s_last_error);
+        return false;
+    }
+    if (!cfg.password.empty() && safe_pass.empty()) {
+        s_last_error = "Password contains only invalid characters";
+        log("ERROR: " + s_last_error);
+        return false;
+    }
     
     // === CRITICAL: Release interface from other managers ===
     log("Releasing interface from NetworkManager...");
@@ -363,7 +422,13 @@ bool start(const Config& cfg) {
     
     // Generate hostapd config
     log("Writing hostapd config to " + HOSTAPD_CONF);
+    ensure_dir();
     std::ofstream hconf(HOSTAPD_CONF);
+    if (!hconf.is_open()) {
+        s_last_error = "Failed to create hostapd config file";
+        log("ERROR: " + s_last_error);
+        return false;
+    }
     hconf << "interface=" << safe_iface << "\n";
     hconf << "driver=nl80211\n";
     hconf << "ssid=" << safe_ssid << "\n";
@@ -388,6 +453,12 @@ bool start(const Config& cfg) {
     }
     hconf.close();
     
+    if (hconf.fail()) {
+        s_last_error = "Failed to write hostapd config";
+        log("ERROR: " + s_last_error);
+        return false;
+    }
+    
     // Set restrictive permissions on config (contains password)
     std::filesystem::permissions(HOSTAPD_CONF, 
         std::filesystem::perms::owner_read | std::filesystem::perms::owner_write);
@@ -398,6 +469,11 @@ bool start(const Config& cfg) {
     // Generate dnsmasq config
     log("Writing dnsmasq config to " + DNSMASQ_CONF);
     std::ofstream dconf(DNSMASQ_CONF);
+    if (!dconf.is_open()) {
+        s_last_error = "Failed to create dnsmasq config file";
+        log("ERROR: " + s_last_error);
+        return false;
+    }
     dconf << "interface=" << safe_iface << "\n";
     dconf << "bind-interfaces\n";
     dconf << "dhcp-range=" << cfg.dhcp_start << "," << cfg.dhcp_end << ",24h\n";
@@ -405,6 +481,12 @@ bool start(const Config& cfg) {
     dconf << "dhcp-option=option:dns-server,8.8.8.8,8.8.4.4\n";
     dconf << "dhcp-leasefile=" << DNSMASQ_LEASES << "\n";
     dconf.close();
+    
+    if (dconf.fail()) {
+        s_last_error = "Failed to write dnsmasq config";
+        log("ERROR: " + s_last_error);
+        return false;
+    }
     
     // Start hostapd (foreground briefly to capture output)
     log("Starting hostapd...");
@@ -592,7 +674,7 @@ std::vector<Client> get_clients() {
     while (std::getline(ss, line)) {
         // iw format: "Station aa:bb:cc:dd:ee:ff (on wlan0)"
         if (line.find("Station ") == 0) {
-            if (in_station && !current.mac.empty()) {
+            if (in_station && !current.mac.empty() && is_valid_mac(current.mac)) {
                 current.connected = true;
                 result.push_back(current);
             }
@@ -602,12 +684,15 @@ std::vector<Client> get_clients() {
             size_t start = 8;
             size_t end = line.find(" ", start);
             if (end != std::string::npos) {
-                current.mac = line.substr(start, end - start);
+                std::string mac_candidate = line.substr(start, end - start);
+                if (is_valid_mac(mac_candidate)) {
+                    current.mac = mac_candidate;
+                }
             }
         }
         // hostapd_cli format: MAC address on its own line (aa:bb:cc:dd:ee:ff)
-        else if (line.length() == 17 && line[2] == ':' && line[5] == ':') {
-            if (in_station && !current.mac.empty()) {
+        else if (line.length() == 17 && is_valid_mac(line)) {
+            if (in_station && !current.mac.empty() && is_valid_mac(current.mac)) {
                 current.connected = true;
                 result.push_back(current);
             }
@@ -657,7 +742,7 @@ std::vector<Client> get_clients() {
     }
     
     // Don't forget last station
-    if (in_station && !current.mac.empty()) {
+    if (in_station && !current.mac.empty() && is_valid_mac(current.mac)) {
         current.connected = true;
         result.push_back(current);
     }
@@ -675,6 +760,10 @@ std::vector<Client> get_clients() {
             std::string timestamp, mac, ip, hostname;
             iss >> timestamp >> mac >> ip >> hostname;
             
+            // Validate lease data
+            if (!is_valid_mac(mac)) continue;
+            if (!is_valid_ip(ip)) continue;
+            
             // Convert MAC to lowercase for comparison
             std::transform(mac.begin(), mac.end(), mac.begin(), ::tolower);
             
@@ -684,7 +773,7 @@ std::vector<Client> get_clients() {
                 
                 if (client_mac == mac) {
                     client.ip = ip;
-                    client.hostname = (hostname == "*") ? "" : hostname;
+                    client.hostname = sanitize_hostname((hostname == "*") ? "" : hostname);
                     break;
                 }
             }
