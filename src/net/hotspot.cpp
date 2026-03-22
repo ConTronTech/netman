@@ -114,14 +114,50 @@ static bool is_valid_country(const std::string& cc) {
     return false;
 }
 
-// Validate IP address format (basic check)
+// Validate IP address format (proper check)
 static bool is_valid_ip(const std::string& ip) {
-    int dots = 0;
-    for (char c : ip) {
-        if (c == '.') dots++;
-        else if (!std::isdigit(c)) return false;
+    std::istringstream ss(ip);
+    std::string octet;
+    int count = 0;
+    
+    while (std::getline(ss, octet, '.')) {
+        if (octet.empty() || octet.length() > 3) return false;
+        for (char c : octet) {
+            if (!std::isdigit(c)) return false;
+        }
+        int val = std::stoi(octet);
+        if (val < 0 || val > 255) return false;
+        count++;
     }
-    return dots == 3;
+    return count == 4;
+}
+
+// Validate channel number
+static bool is_valid_channel(int ch, const std::string& band) {
+    if (band == "2.4") {
+        return ch >= 1 && ch <= 14;
+    } else if (band == "5") {
+        // Common 5GHz channels
+        static const std::vector<int> valid_5g = {36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144, 149, 153, 157, 161, 165};
+        return std::find(valid_5g.begin(), valid_5g.end(), ch) != valid_5g.end();
+    }
+    return false;
+}
+
+// Validate band
+static bool is_valid_band(const std::string& band) {
+    return band == "2.4" || band == "5";
+}
+
+// Sanitize for config file (remove newlines, control chars)
+static std::string config_escape(const std::string& s) {
+    std::string result;
+    for (char c : s) {
+        if (c >= 32 && c < 127) {  // Printable ASCII only
+            result += c;
+        }
+    }
+    return result;
 }
 
 std::vector<std::string> get_ap_capable_interfaces() {
@@ -165,28 +201,41 @@ std::vector<std::string> get_ap_capable_interfaces() {
     
     // Check each interface for AP mode support
     for (const auto& wif : wifi_ifaces) {
+        std::string safe_wif = shell_escape(wif);
+        if (safe_wif.empty()) continue;  // Skip invalid names
+        
         // Get phy number
-        auto phy = exec::run("iw dev " + wif + " info 2>/dev/null | grep wiphy | awk '{print $2}'");
+        auto phy = exec::run("iw dev " + safe_wif + " info 2>/dev/null | grep wiphy | awk '{print $2}'");
         phy = trim(phy);
         
         if (phy.empty()) {
             // Can't verify AP mode, but include it anyway with warning
-            result.push_back(wif);
+            result.push_back(safe_wif);
+            continue;
+        }
+        
+        // Sanitize phy number (should be digits only)
+        std::string safe_phy;
+        for (char c : phy) {
+            if (std::isdigit(c)) safe_phy += c;
+        }
+        if (safe_phy.empty()) {
+            result.push_back(safe_wif);
             continue;
         }
         
         // Check for AP mode support
-        auto modes = exec::run("iw phy phy" + phy + " info 2>/dev/null | grep -E '^\\s+\\* AP$'");
+        auto modes = exec::run("iw phy phy" + safe_phy + " info 2>/dev/null | grep -E '^\\s+\\* AP$'");
         if (!modes.empty()) {
-            result.push_back(wif);
+            result.push_back(safe_wif);
         } else {
             // Broader check
-            modes = exec::run("iw phy phy" + phy + " info 2>/dev/null | grep -i 'AP'");
+            modes = exec::run("iw phy phy" + safe_phy + " info 2>/dev/null | grep -i 'AP'");
             if (modes.find("* AP") != std::string::npos) {
-                result.push_back(wif);
+                result.push_back(safe_wif);
             } else {
                 // Include anyway, let hostapd fail if it doesn't work
-                result.push_back(wif);
+                result.push_back(safe_wif);
             }
         }
     }
@@ -195,17 +244,26 @@ std::vector<std::string> get_ap_capable_interfaces() {
 }
 
 bool supports_5ghz(const std::string& iface) {
+    std::string safe_iface = shell_escape(iface);
+    if (safe_iface.empty()) return true;  // Assume yes if can't check
+    
     // Method 1: Check via iw phy
-    auto phy = exec::run("iw dev " + iface + " info 2>/dev/null | grep wiphy | awk '{print $2}'");
+    auto phy = exec::run("iw dev " + safe_iface + " info 2>/dev/null | grep wiphy | awk '{print $2}'");
     phy = trim(phy);
     
-    if (!phy.empty()) {
+    // Sanitize phy
+    std::string safe_phy;
+    for (char c : phy) {
+        if (std::isdigit(c)) safe_phy += c;
+    }
+    
+    if (!safe_phy.empty()) {
         // Check for 5GHz frequencies (5000-5999 MHz)
-        auto freqs = exec::run("iw phy phy" + phy + " info 2>/dev/null | grep -E '5[0-9]{3}'");
+        auto freqs = exec::run("iw phy phy" + safe_phy + " info 2>/dev/null | grep -E '5[0-9]{3}'");
         if (!freqs.empty()) return true;
         
         // Check for "Band 2" which is typically 5GHz
-        auto band = exec::run("iw phy phy" + phy + " info 2>/dev/null | grep -i 'Band 2'");
+        auto band = exec::run("iw phy phy" + safe_phy + " info 2>/dev/null | grep -i 'Band 2'");
         if (!band.empty()) return true;
     }
     
@@ -214,7 +272,6 @@ bool supports_5ghz(const std::string& iface) {
     if (!iw_list.empty()) return true;
     
     // Method 3: Assume true if we can't determine (let hostapd fail gracefully)
-    // Most modern cards support both bands
     return true;
 }
 
@@ -248,10 +305,21 @@ bool start(const Config& cfg) {
         log("ERROR: " + s_last_error);
         return false;
     }
+    if (!is_valid_band(cfg.band)) {
+        s_last_error = "Invalid band (must be 2.4 or 5)";
+        log("ERROR: " + s_last_error);
+        return false;
+    }
+    if (!is_valid_channel(cfg.channel, cfg.band)) {
+        s_last_error = "Invalid channel for band";
+        log("ERROR: " + s_last_error);
+        return false;
+    }
     
     // Sanitize inputs for shell safety
     std::string safe_iface = shell_escape(cfg.interface);
-    std::string safe_ssid = cfg.ssid;  // SSID can have special chars, handled in config file
+    std::string safe_ssid = config_escape(cfg.ssid);  // For config file
+    std::string safe_pass = config_escape(cfg.password);  // For config file
     std::string safe_share = shell_escape(cfg.share_from);
     std::string safe_ap_ip = cfg.ap_ip;  // Already validated
     
@@ -298,7 +366,7 @@ bool start(const Config& cfg) {
     std::ofstream hconf(HOSTAPD_CONF);
     hconf << "interface=" << safe_iface << "\n";
     hconf << "driver=nl80211\n";
-    hconf << "ssid=" << cfg.ssid << "\n";
+    hconf << "ssid=" << safe_ssid << "\n";
     hconf << "country_code=" << cfg.country_code << "\n";
     hconf << "ieee80211d=1\n";  // Advertise country code
     hconf << "hw_mode=" << (cfg.band == "5" ? "a" : "g") << "\n";
@@ -310,19 +378,22 @@ bool start(const Config& cfg) {
     hconf << "wmm_enabled=1\n";
     hconf << "ignore_broadcast_ssid=" << (cfg.hidden ? "1" : "0") << "\n";
     
-    if (!cfg.password.empty()) {
+    if (!safe_pass.empty()) {
         hconf << "auth_algs=1\n";
         hconf << "wpa=2\n";
         hconf << "wpa_key_mgmt=WPA-PSK\n";
         hconf << "wpa_pairwise=CCMP\n";
         hconf << "rsn_pairwise=CCMP\n";
-        hconf << "wpa_passphrase=" << cfg.password << "\n";
+        hconf << "wpa_passphrase=" << safe_pass << "\n";
     }
     hconf.close();
     
-    // Log config contents
-    auto conf_contents = exec::run("cat " + HOSTAPD_CONF);
-    log("hostapd.conf:\n" + conf_contents);
+    // Set restrictive permissions on config (contains password)
+    std::filesystem::permissions(HOSTAPD_CONF, 
+        std::filesystem::perms::owner_read | std::filesystem::perms::owner_write);
+    
+    // Log config (without password)
+    log("hostapd.conf written (password redacted)");
     
     // Generate dnsmasq config
     log("Writing dnsmasq config to " + DNSMASQ_CONF);
@@ -415,9 +486,10 @@ bool stop() {
     
     exec::run("pkill -f 'dnsmasq.*netman' 2>/dev/null");
     
-    // Disable NAT
+    // Disable NAT (sanitize inputs)
     if (!s_current_config.share_from.empty()) {
-        disable_nat(s_current_config.interface, s_current_config.share_from);
+        std::string safe_share = shell_escape(s_current_config.share_from);
+        disable_nat(iface, safe_share);
     }
     
     // Cleanup config files
