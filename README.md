@@ -12,37 +12,37 @@ A lightweight Linux network manager GUI that simplifies complex networking tasks
 
 ### Real-World Use Cases
 
-**☕ Coffee Shop / Public WiFi**
+**Coffee Shop / Public WiFi**
 - Spoof your MAC address to avoid tracking across sessions
 - Detect captive portals automatically
 - Block inbound connections while keeping outbound access
 
-**🏠 Home Network Admin**
+**Home Network Admin**
 - See all devices on your network at a glance
 - Monitor bandwidth usage in real-time
 - Quickly identify unknown devices by MAC vendor
 
-**📱 Share Your Connection**
+**Share Your Connection**
 - Turn your laptop into a WiFi hotspot in one click
 - Share ethernet/VPN through WiFi to your phone
 - See who's connected and their signal strength
 
-**🔒 Privacy & Security**
+**Privacy & Security**
 - Randomize MAC on every connect (anti-tracking)
 - Block all traffic to an interface instantly
 - Control inbound vs outbound traffic per-interface
 
-**🛠️ Network Troubleshooting**
+**Network Troubleshooting**
 - Quick overview of all interfaces and their states
 - See gateway, DNS, IPs without terminal commands
 - Device scanning to find IP conflicts or rogue devices
 
-**🎮 LAN Parties / Events**
+**LAN Parties / Events**
 - Instant hotspot for guests
 - Monitor connected clients
 - Bandwidth visibility
 
-**💼 Pentesting / Security Research**
+**Pentesting / Security Research**
 - MAC spoofing for network testing
 - Interface traffic control
 - Quick network reconnaissance
