@@ -100,17 +100,29 @@ static int safe_stoi(const std::string& s, int def = 0) {
     }
 }
 
-// Validate country code (2 uppercase letters)
-static bool is_valid_country(const std::string& cc) {
-    if (cc.length() != 2) return false;
-    return std::isupper(cc[0]) && std::isupper(cc[1]);
-}
-
 // Valid country codes
 static const std::vector<std::string> VALID_COUNTRIES = {
     "US", "CA", "GB", "DE", "FR", "AU", "JP", "CN", "FI", "NL",
     "ES", "IT", "BR", "MX", "IN", "KR", "TW", "SG", "HK", "NZ"
 };
+
+// Validate country code (must be in whitelist)
+static bool is_valid_country(const std::string& cc) {
+    for (const auto& valid : VALID_COUNTRIES) {
+        if (cc == valid) return true;
+    }
+    return false;
+}
+
+// Validate IP address format (basic check)
+static bool is_valid_ip(const std::string& ip) {
+    int dots = 0;
+    for (char c : ip) {
+        if (c == '.') dots++;
+        else if (!std::isdigit(c)) return false;
+    }
+    return dots == 3;
+}
 
 std::vector<std::string> get_ap_capable_interfaces() {
     std::vector<std::string> result;
@@ -231,11 +243,17 @@ bool start(const Config& cfg) {
         log("ERROR: " + s_last_error);
         return false;
     }
+    if (!is_valid_ip(cfg.ap_ip) || !is_valid_ip(cfg.dhcp_start) || !is_valid_ip(cfg.dhcp_end)) {
+        s_last_error = "Invalid IP address format";
+        log("ERROR: " + s_last_error);
+        return false;
+    }
     
     // Sanitize inputs for shell safety
     std::string safe_iface = shell_escape(cfg.interface);
     std::string safe_ssid = cfg.ssid;  // SSID can have special chars, handled in config file
     std::string safe_share = shell_escape(cfg.share_from);
+    std::string safe_ap_ip = cfg.ap_ip;  // Already validated
     
     // === CRITICAL: Release interface from other managers ===
     log("Releasing interface from NetworkManager...");
@@ -278,7 +296,7 @@ bool start(const Config& cfg) {
     // Generate hostapd config
     log("Writing hostapd config to " + HOSTAPD_CONF);
     std::ofstream hconf(HOSTAPD_CONF);
-    hconf << "interface=" << cfg.interface << "\n";
+    hconf << "interface=" << safe_iface << "\n";
     hconf << "driver=nl80211\n";
     hconf << "ssid=" << cfg.ssid << "\n";
     hconf << "country_code=" << cfg.country_code << "\n";
@@ -309,7 +327,7 @@ bool start(const Config& cfg) {
     // Generate dnsmasq config
     log("Writing dnsmasq config to " + DNSMASQ_CONF);
     std::ofstream dconf(DNSMASQ_CONF);
-    dconf << "interface=" << cfg.interface << "\n";
+    dconf << "interface=" << safe_iface << "\n";
     dconf << "bind-interfaces\n";
     dconf << "dhcp-range=" << cfg.dhcp_start << "," << cfg.dhcp_end << ",24h\n";
     dconf << "dhcp-option=option:router," << cfg.ap_ip << "\n";
@@ -346,6 +364,13 @@ bool start(const Config& cfg) {
     auto dnsmasq_result = exec::run("dnsmasq -C " + DNSMASQ_CONF + " --pid-file=" + DNSMASQ_PID + " 2>&1");
     log("dnsmasq output: " + dnsmasq_result);
     
+    // Verify dnsmasq started
+    exec::run("sleep 0.5");
+    if (!std::filesystem::exists(DNSMASQ_PID)) {
+        log("WARNING: dnsmasq may have failed to start");
+        // Don't fail - hotspot can work without DHCP if clients use static IP
+    }
+    
     // Enable NAT if sharing internet
     if (!safe_share.empty()) {
         log("Enabling NAT from " + safe_share);
@@ -359,7 +384,7 @@ bool start(const Config& cfg) {
 }
 
 bool stop() {
-    std::string iface = s_current_config.interface;
+    std::string iface = shell_escape(s_current_config.interface);
     
     // Kill hostapd
     if (std::filesystem::exists(HOSTAPD_PID)) {
@@ -467,7 +492,7 @@ std::vector<Client> get_clients() {
     
     if (!is_running()) return result;
     
-    std::string iface = s_current_config.interface;
+    std::string iface = shell_escape(s_current_config.interface);
     log("get_clients: interface = " + iface);
     
     // Try hostapd_cli first (comes with hostapd), then iw as fallback
@@ -622,14 +647,15 @@ bool disable_nat(const std::string& ap_iface, const std::string& wan_iface) {
 
 std::vector<ChannelInfo> scan_channels(const std::string& iface) {
     std::vector<ChannelInfo> result;
-    log("Scanning channels on " + iface);
+    std::string safe_iface = shell_escape(iface);
+    log("Scanning channels on " + safe_iface);
     
     // Use iwlist or iw to scan
-    auto scan_output = exec::run("timeout 10 iwlist " + iface + " scan 2>/dev/null");
+    auto scan_output = exec::run("timeout 10 iwlist " + safe_iface + " scan 2>/dev/null");
     
     if (scan_output.empty() || scan_output.find("not found") != std::string::npos) {
         // Try iw instead
-        scan_output = exec::run("timeout 10 /usr/sbin/iw dev " + iface + " scan 2>/dev/null");
+        scan_output = exec::run("timeout 10 /usr/sbin/iw dev " + safe_iface + " scan 2>/dev/null");
     }
     
     // Count networks per channel
