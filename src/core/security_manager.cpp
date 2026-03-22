@@ -76,8 +76,7 @@ static const std::vector<std::string> ROOT_COMMAND_WHITELIST = {
     "pkill -f 'wpa_supplicant",
     // Scanning
     "arp-scan ",
-    // Utilities
-    "timeout ",
+    // Utilities (timeout handled specially in exec_timeout, not here)
     "cat /tmp/netman/",
     "sleep ",
     "echo 1 > /proc/sys/net/ipv4/ip_forward",
@@ -855,12 +854,55 @@ SecurityManager::ExecResult SecurityManager::exec(const std::string& cmd, bool n
 }
 
 SecurityManager::ExecResult SecurityManager::exec_timeout(const std::string& cmd, int timeout_sec, bool needs_root) {
+    ExecResult result;
+    
     // Validate timeout range (1 second to 5 minutes)
     if (timeout_sec < 1) timeout_sec = 1;
     if (timeout_sec > 300) timeout_sec = 300;
     
+    // CRITICAL: Validate the INNER command first, before wrapping in timeout
+    // This prevents "timeout X rm -rf /" from bypassing whitelist
+    if (!is_command_allowed(cmd, needs_root)) {
+        result.code = -1;
+        result.err = "Inner command not in whitelist";
+        m_impl->log("[EXEC BLOCKED] timeout wrapper rejected: " + cmd.substr(0, 100));
+        return result;
+    }
+    
+    // Inner command is valid, now wrap with timeout and execute
+    // Skip validation in exec() since we already validated
     std::string timeout_cmd = "timeout " + std::to_string(timeout_sec) + " " + cmd;
-    return exec(timeout_cmd, needs_root);
+    
+    // Direct execution (inner command already validated)
+    log_exec(timeout_cmd, needs_root, -1);
+    
+    if (needs_root && !is_root()) {
+        result.code = -1;
+        result.err = "Root privileges required";
+        m_impl->log("[EXEC DENIED] " + timeout_cmd + " (needs root, not root)");
+        return result;
+    }
+    
+    std::string full_cmd = timeout_cmd + " 2>&1";
+    
+    std::array<char, 4096> buffer;
+    std::unique_ptr<FILE, decltype(&pclose)> pipe(
+        popen(full_cmd.c_str(), "r"), pclose);
+    
+    if (!pipe) {
+        result.code = -1;
+        result.err = "Failed to execute command";
+        return result;
+    }
+    
+    while (fgets(buffer.data(), buffer.size(), pipe.get()) != nullptr) {
+        result.out += buffer.data();
+    }
+    
+    result.code = WEXITSTATUS(pclose(pipe.release()));
+    log_exec(timeout_cmd, needs_root, result.code);
+    
+    return result;
 }
 
 // =============================================================================
