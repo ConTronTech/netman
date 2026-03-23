@@ -372,7 +372,11 @@ void HotspotTab::on_start_clicked() {
         m_status_value.set_text("Scanning for best channel...");
         cfg.channel = hotspot::find_best_channel(iface, cfg.band);
     } else {
-        cfg.channel = std::stoi(channel_str);
+        try {
+            cfg.channel = std::stoi(channel_str);
+        } catch (...) {
+            cfg.channel = 6;  // Safe default
+        }
     }
     
     m_status_value.set_text("Starting...");

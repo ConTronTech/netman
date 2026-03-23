@@ -19,9 +19,57 @@ static bool s_running = false;
 static std::string s_last_error;
 static std::mutex s_state_mutex;  // Protects s_current_config, s_running, s_last_error
 
-// Ensure netman directory exists
-static void ensure_dir() {
-    std::filesystem::create_directories(NETMAN_DIR);
+// Thread-safe state setters
+static void set_error(const std::string& err) {
+    std::lock_guard<std::mutex> lock(s_state_mutex);
+    s_last_error = err;
+}
+
+static void set_running(bool running) {
+    std::lock_guard<std::mutex> lock(s_state_mutex);
+    s_running = running;
+}
+
+static void set_config(const Config& cfg) {
+    std::lock_guard<std::mutex> lock(s_state_mutex);
+    s_current_config = cfg;
+}
+
+static void clear_state() {
+    std::lock_guard<std::mutex> lock(s_state_mutex);
+    s_running = false;
+    s_current_config = Config{};
+}
+
+// Ensure netman directory exists and is secure
+static bool ensure_dir() {
+    namespace fs = std::filesystem;
+    
+    // If directory exists, verify it's not a symlink
+    if (fs::exists(NETMAN_DIR)) {
+        if (fs::is_symlink(NETMAN_DIR)) {
+            // Symlink attack - refuse to use
+            return false;
+        }
+    } else {
+        fs::create_directories(NETMAN_DIR);
+    }
+    
+    // Set restrictive permissions (owner only)
+    fs::permissions(NETMAN_DIR, 
+        fs::perms::owner_all,
+        fs::perm_options::replace);
+    
+    return true;
+}
+
+// Check if a file path is safe (not a symlink)
+static bool is_safe_file_path(const std::string& path) {
+    namespace fs = std::filesystem;
+    if (fs::exists(path) && fs::is_symlink(path)) {
+        return false;  // Symlink attack
+    }
+    return true;
 }
 
 // Debug log with rotation (max 1MB)
@@ -54,6 +102,7 @@ static void log(const std::string& msg) {
 }
 
 std::string get_last_error() {
+    std::lock_guard<std::mutex> lock(s_state_mutex);
     return s_last_error;
 }
 
@@ -398,7 +447,17 @@ bool start(const Config& cfg) {
     
     // Generate hostapd config
     log("Writing hostapd config to " + HOSTAPD_CONF);
-    ensure_dir();
+    if (!ensure_dir()) {
+        s_last_error = "Security: /tmp/netman is a symlink";
+        log("ERROR: " + s_last_error);
+        return false;
+    }
+    // Check for symlink attack on config file
+    if (!is_safe_file_path(HOSTAPD_CONF)) {
+        s_last_error = "Security: config file is a symlink";
+        log("ERROR: " + s_last_error);
+        return false;
+    }
     std::ofstream hconf(HOSTAPD_CONF);
     if (!hconf.is_open()) {
         s_last_error = "Failed to create hostapd config file";
@@ -444,6 +503,11 @@ bool start(const Config& cfg) {
     
     // Generate dnsmasq config
     log("Writing dnsmasq config to " + DNSMASQ_CONF);
+    if (!is_safe_file_path(DNSMASQ_CONF)) {
+        s_last_error = "Security: dnsmasq config is a symlink";
+        log("ERROR: " + s_last_error);
+        return false;
+    }
     std::ofstream dconf(DNSMASQ_CONF);
     if (!dconf.is_open()) {
         s_last_error = "Failed to create dnsmasq config file";
@@ -506,8 +570,8 @@ bool start(const Config& cfg) {
         enable_nat(safe_iface, safe_share);
     }
     
-    s_current_config = cfg;
-    s_running = true;
+    set_config(cfg);
+    set_running(true);
     log("=== Hotspot started successfully ===");
     return true;
 }
@@ -566,12 +630,13 @@ bool stop() {
         SEC.exec("ip link set " + safe_iface + " up", false);
     }
     
-    s_running = false;
-    s_current_config = Config{};
+    clear_state();
     return true;
 }
 
 bool is_running() {
+    std::lock_guard<std::mutex> lock(s_state_mutex);
+    
     // Check if hostapd is actually running
     if (!std::filesystem::exists(HOSTAPD_PID)) {
         s_running = false;
