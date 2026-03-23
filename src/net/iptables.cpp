@@ -107,18 +107,18 @@ IOState get_io_state(const std::string& iface) {
     
     std::string comment = "netman-io-" + safe_iface;
     
-    // Check for our rules
+    // Check for our rules (iptables -C returns 0 if rule exists)
     auto input_check = SEC.exec(
         "iptables -C INPUT -i " + safe_iface + 
-        " -m comment --comment \"" + comment + "\" -j DROP && echo found",
+        " -m comment --comment \"" + comment + "\" -j DROP",
         true);
     auto output_check = SEC.exec(
         "iptables -C OUTPUT -o " + safe_iface + 
-        " -m comment --comment \"" + comment + "\" -j DROP && echo found",
+        " -m comment --comment \"" + comment + "\" -j DROP",
         true);
     
-    bool input_blocked = input_check.out.find("found") != std::string::npos;
-    bool output_blocked = output_check.out.find("found") != std::string::npos;
+    bool input_blocked = (input_check.code == 0);
+    bool output_blocked = (output_check.code == 0);
     
     if (input_blocked && output_blocked) return IOState::BLOCKED;
     if (input_blocked) return IOState::OUTBOUND_ONLY;
