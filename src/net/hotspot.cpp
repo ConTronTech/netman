@@ -357,7 +357,7 @@ bool start(const Config& cfg) {
     log("Releasing interface from NetworkManager...");
     
     // Stop NetworkManager from managing this interface
-    auto nm_result = SEC.exec("nmcli device set " + safe_iface + " managed no 2>&1", false).out;
+    auto nm_result = SEC.exec("nmcli device set " + safe_iface + " managed no", false).out;
     log("nmcli result: " + nm_result);
     
     // Kill wpa_supplicant for this interface via PID file if exists
@@ -378,22 +378,22 @@ bool start(const Config& cfg) {
     SEC.exec("ip addr flush dev " + safe_iface, false).out;
     
     // Set interface type
-    SEC.exec("iw dev " + safe_iface + " set type managed 2>/dev/null", false).out;
+    SEC.exec("iw dev " + safe_iface + " set type managed", false).out;
     
     // Set static IP for AP
     log("Setting IP " + safe_ap_ip + "...");
-    auto ip_result = SEC.exec("ip addr add " + safe_ap_ip + "/24 dev " + safe_iface + " 2>&1", false).out;
+    auto ip_result = SEC.exec("ip addr add " + safe_ap_ip + "/24 dev " + safe_iface + "", false).out;
     log("ip addr result: " + ip_result);
     
     SEC.exec("ip link set " + safe_iface + " up", false).out;
     
     // Verify interface is up
-    auto link_state = SEC.exec("ip link show " + safe_iface + " 2>&1", false).out;
+    auto link_state = SEC.exec("ip link show " + safe_iface + "", false).out;
     log("Link state: " + link_state);
     
     // Set regulatory domain (required for 5GHz AP mode)
     log("Setting regulatory domain to " + safe_country);
-    SEC.exec("iw reg set " + safe_country + " 2>&1", false).out;
+    SEC.exec("iw reg set " + safe_country + "", false).out;
     SEC.exec("sleep 0.3", false).out;
     
     // Generate hostapd config
@@ -466,7 +466,7 @@ bool start(const Config& cfg) {
     
     // Start hostapd (foreground briefly to capture output)
     log("Starting hostapd...");
-    auto hostapd_cmd = "hostapd -B -P " + HOSTAPD_PID + " " + HOSTAPD_CONF + " 2>&1";
+    auto hostapd_cmd = "hostapd -B -P " + HOSTAPD_PID + " " + HOSTAPD_CONF + "";
     log("Command: " + hostapd_cmd);
     auto hostapd_result = SEC.exec(hostapd_cmd, false).out;
     log("hostapd output: " + hostapd_result);
@@ -490,7 +490,7 @@ bool start(const Config& cfg) {
     
     // Start dnsmasq
     log("Starting dnsmasq...");
-    auto dnsmasq_result = SEC.exec("dnsmasq -C " + DNSMASQ_CONF + " --pid-file=" + DNSMASQ_PID + " 2>&1", false).out;
+    auto dnsmasq_result = SEC.exec("dnsmasq -C " + DNSMASQ_CONF + " --pid-file=" + DNSMASQ_PID + "", false).out;
     log("dnsmasq output: " + dnsmasq_result);
     
     // Verify dnsmasq started
@@ -768,9 +768,9 @@ bool enable_nat(const std::string& ap_iface, const std::string& wan_iface) {
 }
 
 bool disable_nat(const std::string& ap_iface, const std::string& wan_iface) {
-    SEC.exec("iptables -t nat -D POSTROUTING -o " + wan_iface + " -j MASQUERADE 2>/dev/null", false).out;
-    SEC.exec("iptables -D FORWARD -i " + ap_iface + " -o " + wan_iface + " -j ACCEPT 2>/dev/null", false).out;
-    SEC.exec("iptables -D FORWARD -i " + wan_iface + " -o " + ap_iface + " -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null", false).out;
+    SEC.exec("iptables -t nat -D POSTROUTING -o " + wan_iface + " -j MASQUERADE", false).out;
+    SEC.exec("iptables -D FORWARD -i " + ap_iface + " -o " + wan_iface + " -j ACCEPT", false).out;
+    SEC.exec("iptables -D FORWARD -i " + wan_iface + " -o " + ap_iface + " -m state --state RELATED,ESTABLISHED -j ACCEPT", false).out;
     
     return true;
 }

@@ -1,5 +1,5 @@
 #include "state.hpp"
-#include "../helpers/exec.hpp"
+#include "security_manager.hpp"
 #include <chrono>
 
 AppState::AppState() {}
@@ -112,7 +112,8 @@ void AppState::refresh_network_status() {
     bool has_net = false;
     bool captive = false;
     
-    auto result = exec::run("curl -s --connect-timeout 3 --max-time 5 http://captive.apple.com/hotspot-detect.html 2>/dev/null");
+    // Use SEC.exec_timeout for captive portal check - hardcoded URL for security
+    auto result = SEC.exec_timeout("curl -s http://captive.apple.com/hotspot-detect.html", 5, false).out;
     
     if (result.find("Success") != std::string::npos) {
         has_net = true;

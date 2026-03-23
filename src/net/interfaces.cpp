@@ -35,7 +35,7 @@ static void get_traffic_stats(const std::string& name, uint64_t& rx, uint64_t& t
 // Parse iwconfig for signal strength
 static int get_wifi_signal(const std::string& name) {
     // Name already validated by caller
-    auto result = SEC.exec_timeout("iwconfig " + name + " 2>/dev/null", 5, false);
+    auto result = SEC.exec_timeout("iwconfig " + name + "", 5, false);
     std::string output = result.out;
     
     // Look for "Signal level=-XX dBm" or "Link Quality=XX/70"

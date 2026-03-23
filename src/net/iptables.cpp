@@ -46,13 +46,13 @@ static void clear_io_rules(const std::string& iface) {
     // Try to delete until no more matching rules (max 10 iterations for safety)
     for (int i = 0; i < 10; i++) {
         auto result = SEC.exec(
-            "iptables -D INPUT -i " + iface + " -m comment --comment \"" + comment + "\" -j DROP 2>/dev/null",
+            "iptables -D INPUT -i " + iface + " -m comment --comment \"" + comment + "\" -j DROP",
             true);
         if (result.code != 0) break;
     }
     for (int i = 0; i < 10; i++) {
         auto result = SEC.exec(
-            "iptables -D OUTPUT -o " + iface + " -m comment --comment \"" + comment + "\" -j DROP 2>/dev/null",
+            "iptables -D OUTPUT -o " + iface + " -m comment --comment \"" + comment + "\" -j DROP",
             true);
         if (result.code != 0) break;
     }
@@ -110,11 +110,11 @@ IOState get_io_state(const std::string& iface) {
     // Check for our rules
     auto input_check = SEC.exec(
         "iptables -C INPUT -i " + safe_iface + 
-        " -m comment --comment \"" + comment + "\" -j DROP 2>/dev/null && echo found",
+        " -m comment --comment \"" + comment + "\" -j DROP && echo found",
         true);
     auto output_check = SEC.exec(
         "iptables -C OUTPUT -o " + safe_iface + 
-        " -m comment --comment \"" + comment + "\" -j DROP 2>/dev/null && echo found",
+        " -m comment --comment \"" + comment + "\" -j DROP && echo found",
         true);
     
     bool input_blocked = input_check.out.find("found") != std::string::npos;

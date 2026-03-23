@@ -188,16 +188,21 @@ std::vector<Device> arp_scan(const std::string& interface) {
                 
                 // Quick ping sweep (background, don't wait)
                 // Network prefix is derived from validated IP, safe to use
-                for (int i = 1; i <= 254; i++) {
-                    std::string target_ip = network + std::to_string(i);
-                    // Double-validate the constructed IP
-                    if (!SEC.safe_ip(target_ip).empty()) {
-                        SEC.exec("ping -c 1 -W 1 " + target_ip + " >/dev/null 2>&1 &", false);
+                // Use fping for parallel pinging (much faster, no backgrounding needed)
+                auto fping_check = SEC.exec("which fping", false);
+                if (!fping_check.out.empty()) {
+                    // fping can ping entire subnet at once
+                    SEC.exec_timeout("fping -a -q -g " + network + "1 " + network + "254", 10, false);
+                } else {
+                    // Fallback: sequential pings (slow but works)
+                    for (int i = 1; i <= 254; i += 10) {
+                        // Ping every 10th IP to speed up
+                        std::string target_ip = network + std::to_string(i);
+                        if (!SEC.safe_ip(target_ip).empty()) {
+                            SEC.exec_timeout("ping -c 1 -W 1 " + target_ip, 2, false);
+                        }
                     }
                 }
-                
-                // Wait a moment for ARP table to populate
-                SEC.exec("sleep 2", false);
             }
         }
         

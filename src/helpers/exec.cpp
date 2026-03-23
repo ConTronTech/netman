@@ -1,59 +1,35 @@
+// ============================================================================
+// DEPRECATED - DO NOT USE
+// ============================================================================
+// This helper bypasses SecurityManager and is a security risk.
+// Use SEC.exec() or SEC.exec_timeout() instead.
+//
+// All code should include "../core/security_manager.hpp" and use:
+//   SEC.exec("command", needs_root);
+//   SEC.exec_timeout("command", timeout_sec, needs_root);
+// ============================================================================
+
 #include "exec.hpp"
-#include <array>
-#include <memory>
-#include <cstdio>
 #include <stdexcept>
 
 namespace exec {
 
+[[deprecated("Use SEC.exec() instead - this bypasses security validation")]]
 std::string run(const std::string& cmd) {
-    std::array<char, 4096> buffer;
-    std::string result;
-    
-    std::unique_ptr<FILE, decltype(&pclose)> pipe(
-        popen(cmd.c_str(), "r"), pclose);
-    
-    if (!pipe) {
-        return "";
-    }
-    
-    while (fgets(buffer.data(), buffer.size(), pipe.get()) != nullptr) {
-        result += buffer.data();
-    }
-    
-    return result;
+    (void)cmd;
+    throw std::runtime_error("exec::run() is deprecated - use SEC.exec()");
 }
 
+[[deprecated("Use SEC.exec() instead - this bypasses security validation")]]
 Result run_full(const std::string& cmd) {
-    Result res;
-    
-    // Redirect stderr to stdout for capture
-    std::string full_cmd = cmd + " 2>&1";
-    
-    std::array<char, 4096> buffer;
-    std::unique_ptr<FILE, decltype(&pclose)> pipe(
-        popen(full_cmd.c_str(), "r"), pclose);
-    
-    if (!pipe) {
-        res.code = -1;
-        res.err = "Failed to execute command";
-        return res;
-    }
-    
-    while (fgets(buffer.data(), buffer.size(), pipe.get()) != nullptr) {
-        res.out += buffer.data();
-    }
-    
-    // Get exit code
-    int status = pclose(pipe.release());
-    res.code = WEXITSTATUS(status);
-    
-    return res;
+    (void)cmd;
+    throw std::runtime_error("exec::run_full() is deprecated - use SEC.exec()");
 }
 
+[[deprecated("Use SEC.exec() instead - this bypasses security validation")]]
 Result run_root(const std::string& cmd) {
-    // App runs as root, so just run directly
-    return run_full(cmd);
+    (void)cmd;
+    throw std::runtime_error("exec::run_root() is deprecated - use SEC.exec()");
 }
 
 } // namespace exec

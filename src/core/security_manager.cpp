@@ -117,6 +117,8 @@ static const std::vector<std::string> ROOT_COMMAND_WHITELIST = {
     "arp-scan -l -I ",       // Local scan on specific interface
     "pgrep -a ",             // Process grep with args
     "pgrep -F ",             // PID file check
+    "fping -a -q -g ",       // Parallel ping for ARP population
+    "ping -c ",              // Single ping (count specified)
     
     // === Utilities ===
     "cat /tmp/netman/",      // Read our files only
@@ -811,7 +813,10 @@ static const std::vector<std::string> SAFE_USER_COMMANDS = {
     "iwconfig ",
     "iwlist ",
     "iwgetid ",
-    "curl -s --connect-timeout",  // Specific safe curl pattern
+    // Captive portal detection - hardcoded URLs only (per Orion's review)
+    "curl -s http://captive.apple.com/hotspot-detect.html",
+    "curl -s http://connectivitycheck.gstatic.com/generate_204",
+    "curl -s http://www.msftconnecttest.com/connecttest.txt",
     "getent hosts ",
     "sleep ",
     "ping -c ",     // Only controlled pings
